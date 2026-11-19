@@ -1,0 +1,275 @@
+{
+  "format": "tsumiki-design",
+  "version": 5,
+  "solver": "frame3d-contact-v5",
+  "units": "dimensionless",
+  "name": "横向き雄材の立体枠",
+  "notes": "寸法未確定。座標・材料・荷重は検証用の無次元仮定。接合は穴と角棒の隙間・接触の近似（摩擦なし）。穴の適合・組立可否は未検証。",
+  "jointModel": "clearance-contact",
+  "joint": {
+    "contactStiffness": 2000,
+    "openStiffness": 0.5
+  },
+  "ropeWrap": "locked",
+  "nodes": [
+    {
+      "id": "n0",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "fixed": true
+    },
+    {
+      "id": "n1",
+      "position": [
+        1.4,
+        0,
+        0
+      ],
+      "fixed": true
+    },
+    {
+      "id": "n2",
+      "position": [
+        1.4,
+        0,
+        1
+      ],
+      "fixed": true
+    },
+    {
+      "id": "n3",
+      "position": [
+        0,
+        0,
+        1
+      ],
+      "fixed": true
+    },
+    {
+      "id": "n4",
+      "position": [
+        0,
+        1.2,
+        0
+      ],
+      "fixed": false
+    },
+    {
+      "id": "n5",
+      "position": [
+        1.4,
+        1.2,
+        0
+      ],
+      "fixed": false
+    },
+    {
+      "id": "n6",
+      "position": [
+        1.4,
+        1.2,
+        1
+      ],
+      "fixed": false
+    },
+    {
+      "id": "n7",
+      "position": [
+        0,
+        1.2,
+        1
+      ],
+      "fixed": false
+    }
+  ],
+  "members": [
+    {
+      "id": "m0",
+      "kind": "male",
+      "start": "n0",
+      "end": "n1",
+      "material": "wood",
+      "roll": 0,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m1",
+      "kind": "male",
+      "start": "n3",
+      "end": "n2",
+      "material": "wood",
+      "roll": 0,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m2",
+      "kind": "male",
+      "start": "n4",
+      "end": "n5",
+      "material": "wood",
+      "roll": 0,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m3",
+      "kind": "male",
+      "start": "n7",
+      "end": "n6",
+      "material": "wood",
+      "roll": 0,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m4",
+      "kind": "female",
+      "start": "n0",
+      "end": "n4",
+      "material": "wood",
+      "roll": 90,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m5",
+      "kind": "female",
+      "start": "n1",
+      "end": "n5",
+      "material": "wood",
+      "roll": 90,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m6",
+      "kind": "female",
+      "start": "n2",
+      "end": "n6",
+      "material": "wood",
+      "roll": 90,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m7",
+      "kind": "female",
+      "start": "n3",
+      "end": "n7",
+      "material": "wood",
+      "roll": 90,
+      "layer": 0,
+      "holeCount": 7
+    },
+    {
+      "id": "m8",
+      "kind": "female",
+      "start": "n0",
+      "end": "n3",
+      "material": "wood",
+      "roll": 90,
+      "layer": 1,
+      "holeCount": 7
+    },
+    {
+      "id": "m9",
+      "kind": "female",
+      "start": "n1",
+      "end": "n2",
+      "material": "wood",
+      "roll": 90,
+      "layer": 1,
+      "holeCount": 7
+    },
+    {
+      "id": "m10",
+      "kind": "female",
+      "start": "n4",
+      "end": "n7",
+      "material": "wood",
+      "roll": 90,
+      "layer": 1,
+      "holeCount": 7
+    },
+    {
+      "id": "m11",
+      "kind": "female",
+      "start": "n5",
+      "end": "n6",
+      "material": "wood",
+      "roll": 90,
+      "layer": 1,
+      "holeCount": 7
+    }
+  ],
+  "materials": [
+    {
+      "id": "wood",
+      "E": 10000,
+      "G": 4000,
+      "A": 0.04,
+      "Iy": 0.0005,
+      "Iz": 0.0005,
+      "J": 0.0008,
+      "density": 10
+    }
+  ],
+  "ropes": [
+    {
+      "id": "r0",
+      "route": [
+        "n0",
+        "n5",
+        "n4",
+        "n1"
+      ],
+      "stiffness": 120,
+      "prestrain": 0.002,
+      "slack": 0.025,
+      "windingMember": "m0"
+    },
+    {
+      "id": "r1",
+      "route": [
+        "n3",
+        "n6",
+        "n7",
+        "n2"
+      ],
+      "stiffness": 120,
+      "prestrain": 0.002,
+      "slack": 0.025,
+      "windingMember": "m1"
+    }
+  ],
+  "rings": [],
+  "geometry": {
+    "boardWidth": 0.18,
+    "thickness": 0.045,
+    "tenonSize": 0.055,
+    "tenonLength": 0.22499999999999998,
+    "holeSize": 0.065
+  },
+  "connections": [],
+  "analysis": {
+    "loadNode": "n6",
+    "direction": "x",
+    "force": 0.08,
+    "torque": 0,
+    "gravity": 0.02,
+    "baseAcceleration": 0.05,
+    "frequency": 0.8,
+    "duration": 6,
+    "damping": 0.04,
+    "timeStep": 0.008333333333333333,
+    "excitationStop": 3
+  },
+  "view": {
+    "deformationScale": 15
+  }
+}
