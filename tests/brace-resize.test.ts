@@ -10,6 +10,7 @@ import {
   resizeBoard,
   resizeEnds,
   toggleBoardEnd,
+  toggleBoardPitch,
 } from "../src/structure/editor";
 import { addTemplate } from "../src/structure/templates";
 import { rotate3 } from "../src/structure/transform";
@@ -182,3 +183,41 @@ function connectBoardFromTip(d: Design, tip: string) {
   );
   return memberId;
 }
+
+describe("hole pitch across sizes", () => {
+  it("names the male whose hole would vanish when the pitch changes from 140.25 to 280.5 mm", () => {
+    const d = createDrawingDesign("female-1800-square");
+    const { memberId } = insertMaleAtHole(d, "m0", 1, catalogPart("male-600").span, 1);
+    expect(() => resizeBoard(d, "m0", 1)).toThrow(
+      `穴の間隔が 140.25 → 280.5mm に変わるため、雄材 ${memberId}`,
+    );
+    // Every other 140.25 mm hole is also a 280.5 mm hole, so a male in hole 3 (280.5 mm) is kept.
+    const e = createDrawingDesign("female-1800-square");
+    const { memberId: kept } = insertMaleAtHole(e, "m0", 2, catalogPart("male-600").span, 1);
+    expect(resizeBoard(e, "m0", 1).id).toBe("female-2100-square");
+    expect(valid(e).connections.some((c) => c.male === kept && c.female === "m0")).toBe(true);
+  });
+
+  it("lets a shortened board come off a male beyond its new end", () => {
+    const d = createDrawingDesign("female-450-square");
+    const { memberId } = insertMaleAtHole(d, "m0", 3, catalogPart("male-600").span, 1);
+    expect(resizeBoard(d, "m0", -1).id).toBe("female-300-square");
+    expect(valid(d).connections.some((c) => c.male === memberId && c.female === "m0")).toBe(false);
+  });
+
+  it("switches a 2400 between the regular and the 140.25 mm pitch version", () => {
+    const d = createDrawingDesign("female-2400-square");
+    insertMaleAtHole(d, "m0", 2, catalogPart("male-600").span, 1);
+    expect(toggleBoardPitch(d, "m0").id).toBe("female-2400-square-dense");
+    expect(valid(d).members[0].holeCount).toBe(17);
+    expect(toggleBoardPitch(d, "m0").id).toBe("female-2400-square");
+    const short = createDrawingDesign("female-1200-square");
+    expect(() => toggleBoardPitch(short, "m0")).toThrow("2400 の雌材だけ");
+  });
+
+  it("refuses the regular version when a male stands in a 140.25 mm only hole", () => {
+    const d = createDrawingDesign("female-2400-square-dense");
+    const { memberId } = insertMaleAtHole(d, "m0", 3, catalogPart("male-600").span, 1);
+    expect(() => toggleBoardPitch(d, "m0")).toThrow(`雄材 ${memberId}`);
+  });
+});

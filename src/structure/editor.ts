@@ -1,7 +1,16 @@
 import { type CatalogPart, catalogPart, HITOTO_GEOMETRY, HITOTO_PARTS } from "./catalog";
 import { validateMemberCollisions } from "./collision";
 import { createDesign, type Design, type Member, parseDesign, serializeDesign, type Vec3 } from "./design";
-import { boardAxes, dot3, insertionPreview, matchingShaftHoles, scale3, sub3, unit3 } from "./holes";
+import {
+  boardAxes,
+  dot3,
+  holeSite,
+  insertionPreview,
+  matchingShaftHoles,
+  scale3,
+  sub3,
+  unit3,
+} from "./holes";
 import { freeLayers, nextOuterLayer } from "./seats";
 import { rollFacing } from "./templates";
 export function nextId(design: Design, prefix: string) {
@@ -260,6 +269,7 @@ export function resizeBoard(design: Design, memberId: string, step: 1 | -1, move
   if (board?.kind !== "female") throw new Error("伸縮する雌材を選んでください");
   if (design.version !== 6 || !board.catalogId)
     throw new Error("規格ごとの伸縮は図面規格の雌材で使えます。旧モデルでは節点を動かしてください");
+  const current = catalogPart(board.catalogId);
   const next = nextFemaleSize(board.catalogId, step);
   const shared = (id: string) =>
     design.members.some((m) => m.id !== memberId && (m.start === id || m.end === id));
@@ -268,6 +278,7 @@ export function resizeBoard(design: Design, memberId: string, step: 1 | -1, move
   const fixed = design.nodes.find((n) => n.id === fixedId)?.position;
   const old = design.nodes.find((n) => n.id === movingId);
   if (!fixed || !old) throw new Error("部材の節点がありません");
+  assertHolesKept(design, board, current, next, fixedId, movingId);
   const sides = boardSides(design);
   const direction = unit3(sub3(old.position, fixed));
   const position = fixed.map((v, i) => Math.round((v + direction[i] * next.span) * 1e6) / 1e6) as Vec3;
@@ -285,6 +296,59 @@ export function resizeBoard(design: Design, memberId: string, step: 1 | -1, move
   board.catalogId = next.id;
   board.holeCount = next.holes.length;
   keepBoardSides(design, sides);
+  rematchInsertedMales(design);
+  validateMemberCollisions(design);
+  return next;
+}
+/** Hole pitch of a drawing female, in mm (140.25 or 280.5). */
+export function holePitchMm(part: CatalogPart) {
+  return Math.round((part.holes[1] - part.holes[0]) * 1000 * 100) / 100;
+}
+/**
+ * Before a board changes to `next`, checks that every male passing through one of its holes still meets
+ * a hole, measured from the end that stays. Males on the end that moves away, or beyond the new end of a
+ * shortened board, come off it instead. A change of hole pitch (140.25 ⇄ 280.5 mm) is the usual reason a hole goes missing.
+ */
+function assertHolesKept(
+  design: Design,
+  board: Member,
+  current: CatalogPart,
+  next: CatalogPart,
+  fixedId: string,
+  movingId: string | null,
+) {
+  const fixed = design.nodes.find((n) => n.id === fixedId)?.position;
+  if (!fixed) throw new Error("部材の節点がありません");
+  const fromFixed = next.holes.map((h) => (board.start === fixedId ? h : next.span - h));
+  for (const c of design.connections.filter((c) => c.female === board.id)) {
+    const male = design.members.find((m) => m.id === c.male);
+    if (!male || male[c.end] === movingId) continue;
+    const distance = Math.hypot(...sub3(holeSite(design, board.id, c.hole).center, fixed));
+    // A shortened board no longer reaches males beyond its new end; it simply comes off them.
+    if (distance > next.span + 1e-6) continue;
+    if (fromFixed.some((h) => Math.abs(h - distance) < 1e-6)) continue;
+    const [was, will] = [holePitchMm(current), holePitchMm(next)];
+    throw new Error(
+      `${current.label} → ${next.label} では${was !== will ? `穴の間隔が ${was} → ${will}mm に変わるため、` : ""}雄材 ${male.id} が通っている位置（${fixedId} から ${(distance * 1000).toFixed(2)}mm）に穴がなくなります。先に雄材を外すか、別の規格にしてください`,
+    );
+  }
+}
+/**
+ * Switches a 2400 board between the regular 280.5 mm hole pitch and the 140.25 mm pitch version of the
+ * same length. Males through its holes must still meet a hole. Returns the new part.
+ */
+export function toggleBoardPitch(design: Design, memberId: string): CatalogPart {
+  const board = design.members.find((m) => m.id === memberId);
+  if (board?.kind !== "female" || design.version !== 6 || !board.catalogId)
+    throw new Error("穴の間隔を切り替える図面規格の雌材を選んでください");
+  const current = catalogPart(board.catalogId);
+  const id = current.id.endsWith("-dense") ? current.id.replace(/-dense$/, "") : `${current.id}-dense`;
+  if (!HITOTO_PARTS.some((p) => p.id === id))
+    throw new Error("穴の間隔を切り替えられるのは 2400 の雌材だけです（140.25ピッチ版があるのは 2400 だけ）");
+  const next = catalogPart(id);
+  assertHolesKept(design, board, current, next, board.start, null);
+  board.catalogId = next.id;
+  board.holeCount = next.holes.length;
   rematchInsertedMales(design);
   validateMemberCollisions(design);
   return next;
