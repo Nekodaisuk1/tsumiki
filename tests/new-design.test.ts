@@ -37,3 +37,20 @@ describe("building from scratch", () => {
     expect(() => femaleDirections(createSeedDesign(), "missing")).toThrow("起点");
   });
 });
+
+describe("analysis readiness", () => {
+  it("names a missing support and members that are not joined to the supported part", async () => {
+    const { supportProblem } = await import("../src/structure/solver");
+    const design = createSeedDesign();
+    expect(supportProblem(design)).toBeNull();
+    const loose = structuredClone(design);
+    loose.nodes.push(
+      { id: "n9", position: [0, 2, 0], fixed: false },
+      { id: "n10", position: [1, 2, 0], fixed: false },
+    );
+    loose.members.push({ ...loose.members[0], id: "m9", start: "n9", end: "n10" });
+    expect(supportProblem(loose)).toContain("部材 m9 が支持された部分とつながっていません");
+    for (const n of design.nodes) n.fixed = false;
+    expect(supportProblem(design)).toContain("支持（固定した節点）がありません");
+  });
+});

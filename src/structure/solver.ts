@@ -127,8 +127,39 @@ const springEnergy = (s: Spring, m: number) =>
 export function squareTorsionGap(tenon: number, hole: number) {
   return Math.asin(Math.min(1, hole / (tenon * Math.SQRT2))) - Math.PI / 4;
 }
+/**
+ * Names what keeps a design from standing before the stiffness matrix is built, so the user sees which
+ * supports or members to fix instead of a bare singular-matrix message. Members are connected through
+ * shared nodes and recorded hole connections; ropes alone do not hold a part (they only pull).
+ */
+export function supportProblem(design: Design): string | null {
+  if (!design.nodes.some((n) => n.fixed))
+    return "支持（固定した節点）がありません。床や土台に接する節点を「節点」ページで「全6自由度を固定」にしてください";
+  const parent = new Map(design.nodes.map((n) => [n.id, n.id]));
+  const root = (id: string): string => {
+    const up = parent.get(id) ?? id;
+    if (up === id) return id;
+    const top = root(up);
+    parent.set(id, top);
+    return top;
+  };
+  const join = (a: string, b: string) => parent.set(root(a), root(b));
+  for (const m of design.members) join(m.start, m.end);
+  for (const c of design.connections) {
+    const male = design.members.find((m) => m.id === c.male);
+    const female = design.members.find((m) => m.id === c.female);
+    if (male && female) join(male[c.end], female.start);
+  }
+  const supported = new Set(design.nodes.filter((n) => n.fixed).map((n) => root(n.id)));
+  const loose = design.members.filter((m) => !supported.has(root(m.start))).map((m) => m.id);
+  if (loose.length)
+    return `部材 ${loose.join("・")} が支持された部分とつながっていません。雄材の穴・角棒でつなぐか、削除するか、その部分の節点を固定してください（ロープだけでは支えられません）`;
+  return null;
+}
 function assemble(design: Design, mode: RopeMode) {
   validateDesign(design);
+  const problem = supportProblem(design);
+  if (problem) throw new Error(problem);
   if (design.version === 6 && design.jointModel === "clearance-contact")
     throw new Error("図面の丸穴・角丸凸部の接触則は未校正です。剛接合の参考比較を選んでください");
   const nodeCount = design.nodes.length;
