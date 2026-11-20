@@ -1,0 +1,504 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tsumiki:design:6",
+  "title": "Tsumiki Drawing Design v6",
+  "description": "Hitoto drawing geometry: 1000 mm per coordinate unit. Forces and time remain uncalibrated relative quantities. Catalog member spans and hole counts are checked by the application. Rounded tenon corner radius is an explicit assumption; circular-hole contact law is not supported.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "format",
+    "version",
+    "solver",
+    "units",
+    "name",
+    "notes",
+    "jointModel",
+    "joint",
+    "ropeWrap",
+    "nodes",
+    "members",
+    "materials",
+    "ropes",
+    "connections",
+    "rings",
+    "geometry",
+    "analysis",
+    "view"
+  ],
+  "properties": {
+    "format": {
+      "const": "tsumiki-design"
+    },
+    "version": {
+      "const": 6
+    },
+    "solver": {
+      "const": "frame3d-contact-v5"
+    },
+    "units": {
+      "const": "dimensionless"
+    },
+    "name": {
+      "type": "string",
+      "maxLength": 200
+    },
+    "notes": {
+      "type": "string",
+      "maxLength": 10000
+    },
+    "jointModel": {
+      "enum": [
+        "rigid-approximation",
+        "clearance-contact"
+      ]
+    },
+    "joint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contactStiffness",
+        "openStiffness"
+      ],
+      "properties": {
+        "contactStiffness": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 10000000
+        },
+        "openStiffness": {
+          "type": "number",
+          "minimum": 1e-06,
+          "maximum": 10000000
+        }
+      }
+    },
+    "ropeWrap": {
+      "enum": [
+        "sliding",
+        "locked"
+      ]
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "position",
+          "fixed"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "position": {
+            "type": "array",
+            "items": {
+              "type": "number",
+              "minimum": -20,
+              "maximum": 20
+            },
+            "minItems": 3,
+            "maxItems": 3
+          },
+          "fixed": {
+            "type": "boolean"
+          }
+        }
+      },
+      "minItems": 2,
+      "maxItems": 32
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "start",
+          "end",
+          "material",
+          "roll",
+          "layer",
+          "holeCount",
+          "catalogId"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "kind": {
+            "enum": [
+              "male",
+              "female"
+            ]
+          },
+          "start": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "end": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "material": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "roll": {
+            "type": "number",
+            "minimum": -180,
+            "maximum": 180
+          },
+          "layer": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "holeCount": {
+            "type": "integer",
+            "minimum": 2,
+            "maximum": 32
+          },
+          "catalogId": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "minItems": 1,
+      "maxItems": 100
+    },
+    "materials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "E",
+          "G",
+          "A",
+          "Iy",
+          "Iz",
+          "J",
+          "density"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "E": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "G": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "A": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "Iy": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "Iz": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "J": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          },
+          "density": {
+            "type": "number",
+            "minimum": 1e-08,
+            "maximum": 10000000
+          }
+        }
+      },
+      "minItems": 1,
+      "maxItems": 100
+    },
+    "ropes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "route",
+          "stiffness",
+          "prestrain",
+          "slack",
+          "windingMember"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "route": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+            },
+            "minItems": 4,
+            "maxItems": 4,
+            "uniqueItems": true
+          },
+          "stiffness": {
+            "type": "number",
+            "minimum": 0.01,
+            "maximum": 100000
+          },
+          "prestrain": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.02
+          },
+          "slack": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 0.2
+          },
+          "windingMember": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 100
+    },
+    "connections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "male",
+          "female",
+          "end",
+          "hole",
+          "seat"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "male": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "female": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "end": {
+            "enum": [
+              "start",
+              "end"
+            ]
+          },
+          "hole": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 31
+          },
+          "seat": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 100
+    },
+    "rings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "member",
+          "end",
+          "slot",
+          "role"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "member": {
+            "type": "string",
+            "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+          },
+          "end": {
+            "enum": [
+              "start",
+              "end"
+            ]
+          },
+          "slot": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "role": {
+            "const": "spacer-unmodeled"
+          }
+        }
+      },
+      "minItems": 0,
+      "maxItems": 100
+    },
+    "geometry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boardWidth",
+        "thickness",
+        "tenonSize",
+        "tenonLength",
+        "holeSize",
+        "specification",
+        "tenonCornerRadius"
+      ],
+      "properties": {
+        "boardWidth": {
+          "const": 0.105
+        },
+        "thickness": {
+          "const": 0.03
+        },
+        "tenonSize": {
+          "const": 0.03
+        },
+        "tenonLength": {
+          "const": 0.165
+        },
+        "holeSize": {
+          "const": 0.039
+        },
+        "specification": {
+          "const": "hitoto-v1"
+        },
+        "tenonCornerRadius": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 0.015
+        }
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "loadNode",
+        "direction",
+        "force",
+        "torque",
+        "gravity",
+        "baseAcceleration",
+        "frequency",
+        "duration",
+        "damping",
+        "timeStep",
+        "excitationStop"
+      ],
+      "properties": {
+        "loadNode": {
+          "type": "string",
+          "pattern": "^[a-zA-Z][\\w-]{0,39}$"
+        },
+        "direction": {
+          "enum": [
+            "x",
+            "y",
+            "z"
+          ]
+        },
+        "force": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 2
+        },
+        "torque": {
+          "type": "number",
+          "minimum": -2,
+          "maximum": 2
+        },
+        "gravity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "baseAcceleration": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "frequency": {
+          "type": "number",
+          "minimum": 0.05,
+          "maximum": 5
+        },
+        "duration": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 12
+        },
+        "damping": {
+          "type": "number",
+          "minimum": 0.001,
+          "maximum": 0.3
+        },
+        "timeStep": {
+          "type": "number",
+          "minimum": 0.004166666666666667,
+          "maximum": 0.016666666666666666
+        },
+        "excitationStop": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 12
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deformationScale"
+      ],
+      "properties": {
+        "deformationScale": {
+          "type": "number",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    }
+  }
+}

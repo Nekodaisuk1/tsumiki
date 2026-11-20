@@ -1,0 +1,87 @@
+{
+  "format": "tsumiki-design",
+  "version": 6,
+  "solver": "frame3d-contact-v5",
+  "units": "dimensionless",
+  "name": "hitoto 2400♀角",
+  "notes": "hitoto_buzai_zumen.pdf p75。形状1単位=1000mm。凸部は角丸30mm角、R6.3mmは仮定。雌材の面取り未再現。材料・荷重・時間は未校正。",
+  "jointModel": "rigid-approximation",
+  "joint": {
+    "contactStiffness": 2000,
+    "openStiffness": 0.5
+  },
+  "ropeWrap": "locked",
+  "nodes": [
+    {
+      "id": "n0",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "fixed": true
+    },
+    {
+      "id": "n1",
+      "position": [
+        2.244,
+        0,
+        0
+      ],
+      "fixed": true
+    }
+  ],
+  "members": [
+    {
+      "id": "m0",
+      "kind": "female",
+      "start": "n0",
+      "end": "n1",
+      "material": "wood",
+      "roll": -90,
+      "layer": 0,
+      "holeCount": 9,
+      "catalogId": "female-2400-square"
+    }
+  ],
+  "materials": [
+    {
+      "id": "wood",
+      "E": 10000,
+      "G": 4000,
+      "A": 0.04,
+      "Iy": 0.0005,
+      "Iz": 0.0005,
+      "J": 0.0008,
+      "density": 10
+    }
+  ],
+  "ropes": [],
+  "rings": [],
+  "geometry": {
+    "specification": "hitoto-v1",
+    "boardWidth": 0.105,
+    "thickness": 0.03,
+    "tenonSize": 0.03,
+    "tenonLength": 0.165,
+    "holeSize": 0.039,
+    "tenonCornerRadius": 0.0063
+  },
+  "connections": [],
+  "analysis": {
+    "loadNode": "n1",
+    "direction": "x",
+    "force": 0.08,
+    "torque": 0,
+    "gravity": 0.02,
+    "baseAcceleration": 0.05,
+    "frequency": 0.8,
+    "duration": 6,
+    "damping": 0.04,
+    "timeStep": 0.008333333333333333,
+    "excitationStop": 3
+  },
+  "view": {
+    "deformationScale": 15
+  }
+}
