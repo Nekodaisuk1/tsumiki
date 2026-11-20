@@ -4,7 +4,11 @@ import { CURVE_SEGMENTS, femaleShape, memberFrame, roundedRectangle, tenonShape 
 import { boardAxes } from "./holes";
 
 type Cell = { points: Vector3[]; normals: Vector3[]; edges: Vector3[]; bounds: Box3 };
-const EPSILON = 1e-8;
+/**
+ * Overlaps up to this depth (1 µm) count as touching. Nodes closer than this are the same node, so the
+ * ends of a part placed between two such nodes can tilt by that much and press faces this far together.
+ */
+const EPSILON = 1e-6;
 const cache = new Map<string, Vector3[][]>();
 
 function localCells(design: Design, member: Member, length: number): Vector3[][] {

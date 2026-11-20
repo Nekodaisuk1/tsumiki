@@ -103,3 +103,32 @@ describe("adding boards by hand", () => {
     expect(after.members.find((m) => m.id === memberId)?.layer).toBe(0);
   });
 });
+
+describe("moving a board to another seat", () => {
+  it("swaps along a board threaded on the same tenon through a hole, not only boards sharing a node", async () => {
+    const { createDrawingDesign, insertMaleAtHole, appendMember, shiftLayer } = await import(
+      "../src/structure/editor"
+    );
+    const { validateMemberCollisions } = await import("../src/structure/collision");
+    const d = createDrawingDesign();
+    // Inserted against the base board's facing side: the base board sits on seat 0 of the start tenon,
+    // and a second board hangs on that tenon's node on seat 1.
+    const { memberId: male } = insertMaleAtHole(d, "m0", 3, catalogPart("male-600").span, -1);
+    const tenon = d.members.find((m) => m.id === male)?.start ?? "";
+    const { memberId: board } = appendMember(
+      d,
+      tenon,
+      "female",
+      [0, 1, 0],
+      catalogPart("female-600-square").span,
+      "female-600-square",
+    );
+    expect(d.members.find((m) => m.id === board)?.layer).toBe(1);
+    // The two boards share no node, only the tenon; both move.
+    const moved = shiftLayer(d, board, -1);
+    expect(moved.sort()).toEqual(["m0", board].sort());
+    expect(d.members.find((m) => m.id === "m0")?.layer).toBe(1);
+    expect(d.members.find((m) => m.id === board)?.layer).toBe(0);
+    expect(() => validateMemberCollisions(d)).not.toThrow();
+  });
+});

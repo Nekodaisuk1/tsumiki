@@ -8,6 +8,7 @@ import {
   createDrawingDesign,
   insertMaleAtHole,
   resizeBoard,
+  resizeEnds,
   toggleBoardEnd,
 } from "../src/structure/editor";
 import { addTemplate } from "../src/structure/templates";
@@ -154,3 +155,30 @@ describe("switching the end of an existing board", () => {
     valid(d);
   });
 });
+
+describe("which end resizing moves", () => {
+  it("moves the free end, keeps the end on a male, and flips on request", () => {
+    const d = createDrawingDesign("female-1200-square");
+    const { nodeId: tip } = insertMaleAtHole(d, "m0", 0, catalogPart("male-600").span, 1);
+    const board = connectBoardFromTip(d, tip);
+    const ends = resizeEnds(d, board);
+    expect(ends.fixed).toBe(tip);
+    const flipped = resizeEnds(d, board, true);
+    expect(flipped.node).toBe(tip);
+    resizeBoard(d, board, 1);
+    const after = d.members.find((m) => m.id === board);
+    expect([after?.start, after?.end]).toContain(tip);
+  });
+});
+
+function connectBoardFromTip(d: Design, tip: string) {
+  const { memberId } = appendMember(
+    d,
+    tip,
+    "female",
+    [1, 0, 0],
+    span("female-1200-square"),
+    "female-1200-square",
+  );
+  return memberId;
+}

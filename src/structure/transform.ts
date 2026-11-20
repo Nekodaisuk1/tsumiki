@@ -1,6 +1,14 @@
 import { validateMemberCollisions } from "./collision";
 import type { Design, Member, Vec3 } from "./design";
-import { boardSides, keepBoardSides, nextId, rematchInsertedMales } from "./editor";
+import {
+  boardSides,
+  connectThreadedMales,
+  keepBoardSides,
+  nextId,
+  placeBoard,
+  rematchInsertedMales,
+  removeMember,
+} from "./editor";
 import { add3, cross3, dot3, holeSite, scale3, sub3 } from "./holes";
 import { nextOuterLayer } from "./seats";
 import { rollFacing } from "./templates";
@@ -313,4 +321,320 @@ export class HingeSweep {
       throw error;
     }
   }
+}
+
+/** A mirror plane through `point` with unit `normal`. */
+export type MirrorPlane = { point: Vec3; normal: Vec3 };
+/**
+ * The plane across the middle of `maleId`, perpendicular to its shaft: with the two tenons as the ends of
+ * the male, a structure built symmetrically about the male mirrors one tenon side onto the other.
+ */
+export function mirrorPlane(design: Design, maleId: string): MirrorPlane {
+  const male = design.members.find((m) => m.id === maleId);
+  if (male?.kind !== "male") throw new Error("中心にする雄材を選んでください");
+  const [a, b] = positions(design, male);
+  const shaft = sub3(b, a);
+  // Keep axis-aligned normals exact so mirrored nodes stay on the editor's grid.
+  const normal = scale3(shaft, 1 / Math.hypot(...shaft)).map((v) => (Math.abs(v) < 1e-12 ? 0 : v)) as Vec3;
+  return { point: round(scale3(add3(a, b), 0.5)), normal };
+}
+const reflect = (v: Vec3, n: Vec3) => sub3(v, scale3(n, 2 * dot3(v, n)));
+/**
+ * Adds the mirror image of the given members across `plane`. Boards on one tenon of a male land on the
+ * other tenon of its mirror image (the same male when it straddles the plane) and take the innermost
+ * free layer there; nodes on the plane are shared. Members that would land on an existing member of the same kind (including members on the
+ * plane itself) are skipped, so mirroring a whole structure makes it symmetric. Mirrored males record
+ * the holes they pass through. Ropes and rings are not mirrored. Returns the new members.
+ */
+export function mirrorParts(
+  design: Design,
+  memberIds: string[],
+  plane: MirrorPlane,
+  { allowNone = false } = {},
+): string[] {
+  const axisAligned = plane.normal.filter((v) => Math.abs(v) > 1e-12).length === 1;
+  const nodeAt = (position: Vec3) => {
+    const offset = dot3(sub3(position, plane.point), plane.normal);
+    const raw = sub3(position, scale3(plane.normal, 2 * offset));
+    // An axis-aligned reflection is exact up to rounding; keep coordinates on the editor's 1e-6 grid.
+    const target = axisAligned ? round(raw) : raw;
+    const existing = design.nodes.find((n) => same(n.position, target));
+    if (existing) return existing.id;
+    const id = nextId(design, "n");
+    design.nodes.push({ id, position: target, fixed: false });
+    return id;
+  };
+  const sources = design.members
+    .filter((m) => memberIds.includes(m.id))
+    // Males first, so boards are placed against the tenons they hang on.
+    .sort((a, b) => Number(a.kind === "female") - Number(b.kind === "female"));
+  const created: string[] = [];
+  const inserted: string[] = [];
+  for (const source of sources) {
+    const [a, b] = positions(design, source);
+    const start = nodeAt(a);
+    const end = nodeAt(b);
+    const taken = design.members.some(
+      (m) =>
+        m.kind === source.kind &&
+        ((m.start === start && m.end === end) || (m.start === end && m.end === start)),
+    );
+    // Only existing nodes can already carry a member, so a skipped member left no new node behind.
+    if (taken) {
+      continue;
+    }
+    const [s, e] = positions(design, { ...source, start, end });
+    const member: Member = {
+      ...source,
+      id: nextId(design, "m"),
+      start,
+      end,
+      roll: rollFacing(s, e, reflect(boardNormal(a, b, source.roll), plane.normal)),
+    };
+    if (member.kind === "female") placeBoard(design, member);
+    else design.members.push(member);
+    created.push(member.id);
+    if (design.connections.some((c) => c.male === source.id)) inserted.push(member.id);
+  }
+  if (!created.length && !allowNone) throw new Error("反対側には既に同じ部材があります（左右対称です）");
+  for (const id of inserted) rematchInsertedMales(design, id);
+  // Mirrored boards may pass over tenons of inserted males through their middle holes (e.g. the image of
+  // a lengthened board), so every inserted male records its holes again; mirrored males may also stand
+  // in holes of boards they do not share a node with.
+  rematchInsertedMales(design);
+  connectThreadedMales(design);
+  return created;
+}
+
+/** The member of the same kind lying where `member` lands when mirrored across `plane`, if any. */
+export function mirrorCounterpart(design: Design, member: Member, plane: MirrorPlane): string | undefined {
+  const image = (id: string) => {
+    const at = design.nodes.find((n) => n.id === id)?.position;
+    if (!at) return undefined;
+    const target = sub3(at, scale3(plane.normal, 2 * dot3(sub3(at, plane.point), plane.normal)));
+    return design.nodes.find((n) => same(n.position, target))?.id;
+  };
+  const start = image(member.start);
+  const end = image(member.end);
+  if (!start || !end) return undefined;
+  return design.members.find(
+    (m) =>
+      m.kind === member.kind &&
+      ((m.start === start && m.end === end) || (m.start === end && m.end === start)),
+  )?.id;
+}
+/** What identifies a member's placement, to tell which members an edit changed. */
+function placement(design: Design, m: Member) {
+  const ends = positions(design, m)
+    .map((p) => p.map((v) => v.toFixed(6)).join(","))
+    .sort();
+  return [m.kind, m.catalogId ?? "", m.roll.toFixed(6), m.holeCount, ...ends].join("|");
+}
+/**
+ * Mirror modelling: repeats on the other side of `plane` what an edit did to `after` compared with
+ * `before`. A removed member takes its mirror image with it; a changed member replaces its old image with
+ * a new one; an added member gets an image. Members edited together with their own image (e.g. a whole
+ * symmetric structure moved at once) are left as they are. Returns the members added on the other side
+ * and the edited members that lie on the plane itself, which have no other side.
+ */
+export function mirrorEdit(
+  before: Design,
+  after: Design,
+  plane: MirrorPlane,
+): { created: string[]; onPlane: string[] } {
+  const old = new Map(before.members.map((m) => [m.id, m]));
+  const changed = after.members.filter((m) => {
+    const was = old.get(m.id);
+    return !was || placement(before, was) !== placement(after, m);
+  });
+  const removed = before.members.filter((m) => !after.members.some((v) => v.id === m.id));
+  const edited = new Set([...changed.map((m) => m.id), ...removed.map((m) => m.id)]);
+  // The image of each edited member in the design before the edit.
+  const images = new Map<string, string | undefined>();
+  for (const id of edited) {
+    const was = old.get(id);
+    images.set(id, was ? mirrorCounterpart(before, was, plane) : undefined);
+  }
+  const paired = (id: string) => {
+    const image = images.get(id);
+    return image !== undefined && image !== id && edited.has(image);
+  };
+  for (const id of edited) {
+    const image = images.get(id);
+    if (!image || image === id || paired(id)) continue;
+    if (after.members.some((m) => m.id === image)) removeMember(after, image);
+  }
+  const toMirror = changed.filter((m) => !paired(m.id) && after.members.some((v) => v.id === m.id));
+  const onPlane = toMirror.filter((m) => mirrorCounterpart(after, m, plane) === m.id).map((m) => m.id);
+  const created = mirrorParts(
+    after,
+    toMirror.map((m) => m.id),
+    plane,
+    { allowNone: true },
+  );
+  return { created, onPlane };
+}
+
+export type HoleRef = { female: string; hole: number };
+/**
+ * Turns the board of `moving` about the tenon it hangs on until that hole lies over `target`, so one
+ * male can pass through both. Only the board turns (see `jointConstraint`); its other joints must lie
+ * on the same shaft. The holes must face along that shaft and sit at the same distance from it.
+ * Returns the angle turned, in degrees.
+ */
+export function alignHole(design: Design, target: HoleRef, moving: HoleRef): number {
+  if (target.female === moving.female) throw new Error("別の雌材の穴を選んでください");
+  const constraint = jointConstraint(design, "member", moving.female);
+  if (constraint.kind !== "hinge")
+    throw new Error(
+      constraint.kind === "locked"
+        ? `雌材 ${moving.female} は別々の軸の雄材に固定されているため回せません`
+        : `雌材 ${moving.female} は雄材の角棒に載っていないため、回す軸がありません`,
+    );
+  const { pivot, axis } = constraint.hinge;
+  const a = holeSite(design, moving.female, moving.hole);
+  const b = holeSite(design, target.female, target.hole);
+  if (Math.abs(Math.abs(dot3(b.normal, axis)) - 1) > 1e-6)
+    throw new Error(`雌材 ${target.female} の穴は回す軸と平行ではないため、重ねられません`);
+  const across = (p: Vec3) => {
+    const offset = sub3(p, pivot);
+    return sub3(offset, scale3(axis, dot3(offset, axis)));
+  };
+  const from = across(a.center);
+  const to = across(b.center);
+  const [r, R] = [Math.hypot(...from), Math.hypot(...to)];
+  if (Math.abs(r - R) > 1e-5)
+    throw new Error(
+      `角棒からの距離が違うため重なりません（${moving.female} の穴 ${(r * 1000).toFixed(1)}mm・${target.female} の穴 ${(R * 1000).toFixed(1)}mm）`,
+    );
+  const angle = (Math.atan2(dot3(axis, cross3(from, to)), dot3(from, to)) * 180) / Math.PI;
+  if (Math.abs(angle) < 1e-9) return 0;
+  moveParts(design, "member", moving.female, { translate: [0, 0, 0], axis, angle, pivot });
+  return angle;
+}
+
+/** The hinge a board turns about, with a reason when it cannot turn. */
+function boardHinge(design: Design, female: string): Hinge {
+  const constraint = jointConstraint(design, "member", female);
+  if (constraint.kind === "hinge") return constraint.hinge;
+  throw new Error(
+    constraint.kind === "locked"
+      ? `雌材 ${female} は別々の軸の雄材に固定されているため回せません`
+      : `雌材 ${female} は雄材の角棒に載っていないため、回す軸がありません`,
+  );
+}
+/**
+ * Lays the second and later holes over the first. A hole at the same distance from its tenon as the
+ * first one turns its board alone. Otherwise both boards turn about their own tenons (which must be
+ * parallel) to where the two holes meet: of the up to two meeting points, the one free of collisions
+ * with the least turning wins. Returns how far each board turned, in degrees.
+ */
+export function alignHoles(design: Design, holes: HoleRef[]): { female: string; angle: number }[] {
+  const [target, ...rest] = holes;
+  if (!target || !rest.length) throw new Error("穴を2つ以上選んでください");
+  const turns: { female: string; angle: number }[] = [];
+  let targetTurned = false;
+  for (const moving of rest) {
+    if (moving.female === target.female) throw new Error("別の雌材の穴を選んでください");
+    const hinge = boardHinge(design, moving.female);
+    const radius = (h: Hinge, hole: HoleRef) => {
+      const offset = sub3(holeSite(design, hole.female, hole.hole).center, h.pivot);
+      return Math.hypot(...sub3(offset, scale3(h.axis, dot3(offset, h.axis))));
+    };
+    const same =
+      Math.abs(radius(hinge, moving) - radius(hinge, target)) <= 1e-5 &&
+      Math.abs(Math.abs(dot3(holeSite(design, target.female, target.hole).normal, hinge.axis)) - 1) <= 1e-6;
+    if (same || targetTurned) {
+      turns.push({ female: moving.female, angle: alignHole(design, target, moving) });
+      continue;
+    }
+    let other: Hinge;
+    try {
+      other = boardHinge(design, target.female);
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      // The base board cannot turn, so only the single-board rule applies; report why it fails.
+      alignHole(design, target, moving);
+      throw error;
+    }
+    if (Math.abs(Math.abs(dot3(other.axis, hinge.axis)) - 1) > 1e-6)
+      throw new Error(
+        `雌材 ${moving.female} と ${target.female} の角棒が平行ではないため、穴を重ねられません`,
+      );
+    const pair = meetingTurns(design, hinge, moving, other, target);
+    turns.push({ female: moving.female, angle: pair.moving }, { female: target.female, angle: pair.target });
+    targetTurned = true;
+  }
+  return turns;
+}
+/** Turns both boards about their parallel tenons so their holes meet; returns the two angles. */
+function meetingTurns(design: Design, a: Hinge, holeA: HoleRef, b: Hinge, holeB: HoleRef) {
+  const axis = a.axis;
+  // Plane coordinates perpendicular to the shafts.
+  const u = Math.abs(axis[0]) < 0.9 ? cross3(axis, [1, 0, 0]) : cross3(axis, [0, 1, 0]);
+  const e1 = scale3(u, 1 / Math.hypot(...u));
+  const e2 = cross3(axis, e1);
+  const flat = (p: Vec3): [number, number] => [dot3(p, e1), dot3(p, e2)];
+  const ca = flat(a.pivot);
+  const cb = flat(b.pivot);
+  const pa = flat(holeSite(design, holeA.female, holeA.hole).center);
+  const pb = flat(holeSite(design, holeB.female, holeB.hole).center);
+  const ra = Math.hypot(pa[0] - ca[0], pa[1] - ca[1]);
+  const rb = Math.hypot(pb[0] - cb[0], pb[1] - cb[1]);
+  const d = Math.hypot(cb[0] - ca[0], cb[1] - ca[1]);
+  if (d < 1e-9) throw new Error("同じ角棒に載る雌材どうしは、角棒からの距離が同じ穴しか重なりません");
+  if (d > ra + rb + 1e-9 || d < Math.abs(ra - rb) - 1e-9)
+    throw new Error(
+      `穴が届きません（角棒どうしの間隔 ${(d * 1000).toFixed(1)}mm に対し、角棒から穴まで ${(ra * 1000).toFixed(1)}mm と ${(rb * 1000).toFixed(1)}mm）`,
+    );
+  const along = (d * d + ra * ra - rb * rb) / (2 * d);
+  const h = Math.sqrt(Math.max(0, ra * ra - along * along));
+  const ux = (cb[0] - ca[0]) / d;
+  const uy = (cb[1] - ca[1]) / d;
+  const base = [ca[0] + ux * along, ca[1] + uy * along];
+  const points = [
+    [base[0] - uy * h, base[1] + ux * h],
+    [base[0] + uy * h, base[1] - ux * h],
+  ];
+  // Signed angle about the shaft (e1 × e2 = axis) from one plane vector to another, in degrees.
+  const turn = (from: number[], to: number[]) =>
+    (Math.atan2(from[0] * to[1] - from[1] * to[0], from[0] * to[0] + from[1] * to[1]) * 180) / Math.PI;
+  const options = points.map((p) => ({
+    moving: turn([pa[0] - ca[0], pa[1] - ca[1]], [p[0] - ca[0], p[1] - ca[1]]),
+    target: turn([pb[0] - cb[0], pb[1] - cb[1]], [p[0] - cb[0], p[1] - cb[1]]),
+  }));
+  // Both angles are measured about `axis` (the first shaft); the second shaft may point the other way, so
+  // the second board turns about its own pivot but around the same axis.
+  const apply = (into: Design, option: (typeof options)[number]) => {
+    for (const [pivot, hole, angle] of [
+      [a.pivot, holeA, option.moving],
+      [b.pivot, holeB, option.target],
+    ] as const)
+      if (Math.abs(angle) > 1e-9)
+        moveParts(into, "member", hole.female, { translate: [0, 0, 0], axis, pivot, angle });
+  };
+  const clear = (option: (typeof options)[number]) => {
+    const draft = structuredClone(design);
+    try {
+      apply(draft, option);
+      validateMemberCollisions(draft, new Set([holeA.female, holeB.female]));
+      return true;
+    } catch (error) {
+      // A meeting point that collides is simply the worse choice.
+      if (error instanceof Error) return false;
+      throw error;
+    }
+  };
+  const ranked = options
+    .map((option) => ({
+      option,
+      clear: clear(option),
+      turning: Math.abs(option.moving) + Math.abs(option.target),
+    }))
+    .sort((x, y) => Number(y.clear) - Number(x.clear) || x.turning - y.turning)
+    .map((r) => r.option);
+  apply(design, ranked[0]);
+  // Report each angle about the board's own shaft, like a single-board turn.
+  const sign = dot3(b.axis, axis) < 0 ? -1 : 1;
+  return { moving: ranked[0].moving, target: sign * ranked[0].target };
 }

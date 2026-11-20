@@ -238,6 +238,19 @@ export function braceTargets(design: Design, nodeId: string, preferred?: string)
   return result.sort((x, y) => Number(y.diagonal) - Number(x.diagonal) || x.length - y.length);
 }
 /**
+ * Which end of a board catalog resizing moves: the end not shared with other members, otherwise the end
+ * node (`flip` takes the other one). The other end stays on its tenon.
+ */
+export function resizeEnds(design: Design, memberId: string, flip = false) {
+  const board = design.members.find((m) => m.id === memberId);
+  if (!board) throw new Error("部材がありません");
+  const shared = (id: string) =>
+    design.members.some((m) => m.id !== memberId && (m.start === id || m.end === id));
+  let moving: "start" | "end" = shared(board.end) && !shared(board.start) ? "start" : "end";
+  if (flip) moving = moving === "start" ? "end" : "start";
+  return { moving, node: board[moving], fixed: moving === "start" ? board.end : board.start };
+}
+/**
  * Shortens (−1) or extends (+1) a drawing-catalog female by one catalog size of the same end shape. One end
  * stays on its tenon: the end shared with other members, otherwise the start (`moveStart` flips that).
  * The moving end leaves the members it shared and joins a node it lands on exactly. Returns the new part.
@@ -250,9 +263,7 @@ export function resizeBoard(design: Design, memberId: string, step: 1 | -1, move
   const next = nextFemaleSize(board.catalogId, step);
   const shared = (id: string) =>
     design.members.some((m) => m.id !== memberId && (m.start === id || m.end === id));
-  let moving: "start" | "end" = shared(board.end) && !shared(board.start) ? "start" : "end";
-  if (moveStart) moving = moving === "start" ? "end" : "start";
-  const fixedId = moving === "start" ? board.end : board.start;
+  const { moving, fixed: fixedId } = resizeEnds(design, memberId, moveStart);
   const movingId = board[moving];
   const fixed = design.nodes.find((n) => n.id === fixedId)?.position;
   const old = design.nodes.find((n) => n.id === movingId);
@@ -385,10 +396,16 @@ export function insertMaleAtHole(design: Design, female: string, hole: number, l
       : undefined;
   if (design.version === 6 && !part) throw new Error("図面の雄材規格を選んでください");
   const preview = insertionPreview(design, female, hole, length, side);
-  const startId = nextId(design, "n");
-  design.nodes.push({ id: startId, position: preview.start, fixed: false });
-  const endId = nextId(design, "n");
-  design.nodes.push({ id: endId, position: preview.end, fixed: false });
+  // Reuse a node already at an end (e.g. where the ends of two boards meet) instead of stacking a copy.
+  const nodeAt = (position: Vec3) => {
+    const existing = design.nodes.find((n) => Math.hypot(...sub3(n.position, position)) < 1e-6);
+    if (existing) return existing.id;
+    const id = nextId(design, "n");
+    design.nodes.push({ id, position, fixed: false });
+    return id;
+  };
+  const startId = nodeAt(preview.start);
+  const endId = nodeAt(preview.end);
   const memberId = nextId(design, "m");
   design.members.push({
     id: memberId,
@@ -633,8 +650,10 @@ export function removeMember(design: Design, memberId: string) {
 
 /**
  * Moves a female board one seat outward (+1) or inward (−1) by exchanging the two seats. A board spans two
- * tenons, so every board in those two seats that is linked to it through shared tenons swaps as well;
- * otherwise the far end of a neighbour would collide. Rings in the two seats on those tenons swap too.
+ * tenons, so every board in those two seats that shares a tenon with it swaps as well, and so on along
+ * the chain; otherwise a neighbour would end up in the same seat. Boards share a tenon when they meet at
+ * a node or when one male passes through holes of both. Rings in the two seats on those tenons swap too.
+ * Boards that only cross in the same plane without sharing a tenon do not move along and may collide.
  * Seats 0–3 hold boards; the outermost one is kept for ropes. Returns the boards that changed seat.
  */
 export function shiftLayer(design: Design, femaleId: string, delta: 1 | -1): string[] {
@@ -645,18 +664,31 @@ export function shiftLayer(design: Design, femaleId: string, delta: 1 | -1): str
   if (to < 0 || to > 3)
     throw new Error(delta > 0 ? "これより外側の段はロープ用です" : "これより内側の段はありません");
   const pair = (layer: number) => layer === from || layer === to;
+  // The tenons (male id and end) a board is threaded on through its holes, where its layer counts the
+  // seats on that tenon: the seat equals the layer and the board faces out along the tenon, so swapping
+  // layers moves it outward or inward on that tenon like a board hanging on the tenon's node.
+  const threaded = (board: Member) =>
+    design.connections
+      .filter((c) => {
+        if (c.female !== board.id || c.seat !== board.layer) return false;
+        const male = design.members.find((m) => m.id === c.male);
+        const a = design.nodes.find((n) => n.id === male?.start)?.position;
+        const b = design.nodes.find((n) => n.id === male?.end)?.position;
+        if (!a || !b) return false;
+        const outward = c.end === "end" ? sub3(b, a) : sub3(a, b);
+        return dot3(boardAxes(design, board).normal, outward) > 0;
+      })
+      .map((c) => `${c.male}:${c.end}`);
+  const linked = (a: Member, b: Member) =>
+    [b.start, b.end].some((n) => n === a.start || n === a.end) ||
+    threaded(a).some((tenon) => threaded(b).includes(tenon));
   const group = new Set([female]);
   const queue = [female];
   while (queue.length) {
     const current = queue.pop();
     if (!current) break;
     for (const other of design.members)
-      if (
-        !group.has(other) &&
-        other.kind === "female" &&
-        pair(other.layer) &&
-        [other.start, other.end].some((n) => n === current.start || n === current.end)
-      ) {
+      if (!group.has(other) && other.kind === "female" && pair(other.layer) && linked(current, other)) {
         group.add(other);
         queue.push(other);
       }

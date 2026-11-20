@@ -126,6 +126,17 @@ export function insertionPreview(design: Design, female: string, hole: number, l
   const site = holeSite(design, female, hole);
   const direction = scale3(site.normal, side);
   const t = design.geometry.thickness;
+  if (dot3(direction, site.normal) < 0) {
+    // The body runs against the board's facing side, so the board sits on the tenon at its own layer:
+    // the tenon starts in the plane of the board's tenon node. Boards stacked with empty layers between
+    // them (e.g. two boards turned so their end holes meet) then land on their own seats.
+    const start = site.center;
+    const end = add3(start, scale3(direction, length));
+    const connections = matchingShaftHoles(design, start, end);
+    if (!connections.some((c) => c.female === female && c.hole === hole))
+      throw new Error("選択した穴に接続できません");
+    return { start, end, direction, connections };
+  }
   let outer = 0;
   for (const member of design.members.filter((m) => m.kind === "female"))
     for (let h = 0; h < member.holeCount; h++) {

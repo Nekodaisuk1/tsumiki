@@ -1,6 +1,8 @@
-import { expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
+import { catalogPart } from "../src/structure/catalog";
+import { validateMemberCollisions } from "../src/structure/collision";
 import { createDesign, type Design, parseDesign, serializeDesign, type Vec3 } from "../src/structure/design";
-import { insertMaleAtHole } from "../src/structure/editor";
+import { appendMember, createDrawingDesign, insertMaleAtHole } from "../src/structure/editor";
 
 function pair(kindA: "male" | "female", kindB: "male" | "female", start: Vec3, end: Vec3): Design {
   const d = createDesign();
@@ -109,4 +111,18 @@ it("preserves collision decisions under a rigid three-dimensional rotation", () 
   d.members[1].roll =
     (Math.atan2(-normalY * referenceY[1], normalY * referenceZ[1] + normalZ * referenceZ[2]) * 180) / Math.PI;
   expect(() => serializeDesign(d)).toThrow(/干渉/);
+});
+
+describe("contact tolerance of drawing parts", () => {
+  it("treats faces pressed together by a sub-micron tilt as touching", () => {
+    const d = createDrawingDesign("male-1200");
+    // A board on layer 0 of the end tenon, right against the shoulder of the male body.
+    appendMember(d, "n1", "female", [0, 1, 0], catalogPart("female-600-square").span, "female-600-square");
+    expect(() => validateMemberCollisions(d)).not.toThrow();
+    // Ends of a part closer than the node tolerance can be off by this much after turning parts.
+    const start = d.nodes.find((n) => n.id === "n0");
+    if (!start) throw new Error("No node");
+    start.position = [start.position[0], start.position[1] + 3.5e-7, start.position[2] + 3.5e-7];
+    expect(() => validateMemberCollisions(d)).not.toThrow();
+  });
 });
