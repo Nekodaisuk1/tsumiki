@@ -1,11 +1,47 @@
-import { createDesign, type Design, parseDesign, serializeDesign, validateDesign } from "./structure/design";
-import { appendMember, DesignHistory, extendBay, insertMaleAtHole } from "./structure/editor";
+import { catalogPart, HITOTO_PARTS, memberPart } from "./structure/catalog";
+import {
+  createDesign,
+  type Design,
+  type Member,
+  parseDesign,
+  serializeDesign,
+  type Vec3,
+  validateDesign,
+} from "./structure/design";
+import {
+  AXIS_DIRECTIONS,
+  type AxisDirection,
+  appendMember,
+  boardRoll,
+  braceTargets,
+  connectBoard,
+  createDrawingDesign,
+  DesignHistory,
+  extendBay,
+  femaleDirections,
+  insertMaleAtHole,
+  nextFemaleSize,
+  placeBoard,
+  removeMember,
+  resizeBoard,
+  shiftLayer,
+  toggleBoardEnd,
+} from "./structure/editor";
 import { freeRingSlot } from "./structure/geometry";
 import { holeOccupied, insertionPreview } from "./structure/holes";
 import { detectRopeFrames, ropeOnFrame, routeForWinder, windingUnavailable } from "./structure/rope";
-import { nextOuterLayer } from "./structure/seats";
 import { type Excitation, type RopeMode, simulate, solveStatic } from "./structure/solver";
-import { Viewport } from "./structure/viewport";
+import { addTemplate, apexDirection, type TemplateShape, templateDirections } from "./structure/templates";
+import {
+  HingeSweep,
+  jointConstraint,
+  type MoveTarget,
+  moveParts,
+  pivotOf,
+  rotate3,
+  targetParts,
+} from "./structure/transform";
+import { type TransformSpec, Viewport } from "./structure/viewport";
 import "./workbench.css";
 
 function el<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -17,12 +53,18 @@ const input = (id: string) => el<HTMLInputElement>(id);
 const select = (id: string) => el<HTMLSelectElement>(id);
 const modes: RopeMode[] = ["none", "slack", "taut"];
 const names: Record<RopeMode, string> = { none: "ロープなし", slack: "たるみあり", taut: "張力あり" };
-let design = createDesign();
-let selected = "n6";
+let design = createDrawingDesign();
+let selected = "n0";
 let selectedMember = "m0";
 let selectedRing = "";
 let selectionType: "node" | "member" | "ring" = "node";
 let connectStart: string | null = null;
+/** "selection" moves what is selected (a node, or a member on its own). */
+let moveScope: "selection" | "group" | "all" = "selection";
+let moveMode: "translate" | "rotate" = "translate";
+/** Keep joints to males: a part on one shaft only turns about it, within the range that does not collide. */
+let keepJoints = true;
+let hingeCache: { design: Design; key: string; sweep: HingeSweep } | null = null;
 let choosingHole = false;
 let choosingFrame = false;
 let chosenFrame = "";
@@ -44,29 +86,18 @@ let tab: "model" | "sim" = "model";
 // Results from the previous design stay visible (dimmed) until the debounced recompute lands.
 let stale = false;
 let pendingCalculation = 0;
-let calculationError = false;
 // What the last edit did; kept in the status line after the automatic recompute.
 let actionNote = "";
 
 el("app").innerHTML = `
-<header><a class="brand" href="/">▰ tsumiki <span>STRUCTURE STUDIO</span></a><div class="mode-tabs" role="tablist" aria-label="作業画面"><button id="tab-model" role="tab" type="button" aria-selected="true" aria-controls="model-panel"><kbd>1</kbd> モデリング</button><button id="tab-sim" role="tab" type="button" aria-selected="false" aria-controls="sim-panel" tabindex="-1"><kbd>2</kbd> シミュレーション</button></div><div class="file-actions"><button id="recover" type="button" disabled>下書きを復元</button><button id="import" type="button">設計を読み込む</button><button id="export" class="primary" type="button">↓ 設計を保存</button><input id="file" type="file" accept=".json,.tsumiki.json" hidden></div></header>
-<main><div class="status-line"><div id="status" role="status" class="status">設計を準備中</div><p id="draft-status" class="hint">編集中の設計は、このブラウザにも下書き保存します。</p></div><div id="error" role="alert" class="error" hidden></div>
-<div class="workspace" id="workspace" data-mode="model"><aside class="panel controls model-only" id="model-panel" role="tabpanel" aria-labelledby="tab-model"><h2>部材とロープ</h2>
-<div class="catalog"><p id="quick-anchor" class="hint" hidden>追加の起点：n6</p><p class="hint">クリックで種類を選び、節点から追加。部材そのものも図で選択できます。</p><div class="button-row"><button id="palette-male" type="button" aria-pressed="true">⊣ 雄材 ⊢</button><button id="palette-female" type="button" aria-pressed="false">▣ 雌材</button></div><div id="female-add-tools" hidden><label for="quick-direction">追加方向</label><select id="quick-direction"><option value="x">+X 横</option><option value="-x">−X 横</option><option value="y">+Y 上</option><option value="-y">−Y 下</option><option value="z">+Z 奥</option><option value="-z">−Z 手前</option></select><label for="quick-length">追加する長さ比</label><input id="quick-length" type="number" min="0.2" max="4" step="0.1" value="1"><button id="quick-add" class="primary" type="button">選択節点から部材を追加</button><button id="connect-nodes" type="button" aria-pressed="false">選択節点からクリックで接続</button></div><div id="male-add-tools"><p class="hint">① 雌材の穴を選ぶ → ② 長さ・差し込み側 → ③ 差し込む。垂直方向と座標は自動です。</p><button id="pick-hole" type="button" aria-pressed="false">① 図の穴を選ぶ</button><label for="hole-female">差し込む雌材</label><select id="hole-female"></select><label for="hole-number">差し込む穴</label><select id="hole-number"></select><div class="double"><label>雄材の長さ比<input id="male-length" type="number" min="0.2" max="4" step="0.1" value="1.4"></label><label>差し込み側<select id="male-side"><option value="1">表側へ</option><option value="-1">裏側へ</option></select></label></div><p id="male-preview-status" class="hint">空いている穴を選択してください。</p><button id="insert-male" type="button" class="primary" disabled>③ 雄材を差し込む</button></div><button id="rope-tool" type="button">ロープを張る</button></div>
-<details><summary>枠の構成</summary><div class="triple"><label>幅の比<input id="width" type="number" min="0.4" max="4" step="0.1" value="1.4"></label><label>奥行の比<input id="depth" type="number" min="0.4" max="4" step="0.1" value="1"></label><label>高さの比<input id="height" type="number" min="0.4" max="4" step="0.1" value="1.2"></label></div><button id="extend-bay" type="button">奥に1区画つなぐ</button><button id="generate" type="button">比率から立体枠を作り直す</button><p class="hint">作り直すと形状・接合・ロープ・解析条件を初期化します。名称とメモは保持します。</p></details>
-<details id="node-inspector" open><summary>選択した節点と支持</summary><label for="node">節点（3D図でも選択可）</label><select id="node"></select><div class="triple"><label>X<input id="nx" type="number" step="0.1"></label><label>Y<input id="ny" type="number" step="0.1"></label><label>Z<input id="nz" type="number" step="0.1"></label></div><label class="check"><input id="fixed" type="checkbox">全6自由度を固定</label><button id="apply-node" type="button">節点を更新</button><div class="nudge"><button data-axis="x" data-delta="-1" type="button">−X</button><button data-axis="x" data-delta="1" type="button">+X</button><button data-axis="y" data-delta="-1" type="button">−Y</button><button data-axis="y" data-delta="1" type="button">+Y</button><button data-axis="z" data-delta="-1" type="button">−Z</button><button data-axis="z" data-delta="1" type="button">+Z</button></div><button id="delete-node" type="button">節点と接続を削除</button><div class="button-row"><button id="add-node" type="button">節点を追加</button><button id="add-ring" type="button">丸材を配置</button></div><p class="hint">丸材は雄材の角棒にはめて空き段を埋めます。接触・剛性・質量への寄与は未解析です。</p></details>
-<details id="member-inspector"><summary>選択した部材・形状</summary><label for="member">部材</label><select id="member"></select><label for="kind">種類</label><select id="kind"><option value="male">雄材</option><option value="female">雌材</option></select><div class="double"><label>始点<select id="start"></select></label><label>終点<select id="end"></select></label></div><div class="triple"><label>板の回転 °<input id="member-roll" type="number" min="-180" max="180" step="90" value="0"></label><label>雌材の段<input id="member-layer" type="number" min="0" max="3" step="1" value="0"></label><label>雌材の穴数<input id="member-holes" type="number" min="2" max="32" step="1" value="7"></label></div><p class="hint">雄材・雌材の実体が重なる配置は拒否します（穴内の差し込み・面接触は許容）。段は角棒上の重ね位置。追加は最外側。0〜3段が部材用、先端の1枚分はロープ用です。</p><button id="focus-member" type="button">この部材に寄る</button><div class="button-row"><button id="apply-member" type="button">更新</button><button id="add-member" type="button">追加</button><button id="delete-member" type="button">削除</button></div></details>
-<details id="ring-inspector"><summary>丸材・空き段を埋める</summary><label for="ring-id">配置済みの丸材</label><select id="ring-id"></select><label for="ring-member">はめる雄材</label><select id="ring-member"></select><div class="double"><label>差し込み側<select id="ring-end"><option value="start">始点側</option><option value="end">終点側</option></select></label><label>はめる段<input id="ring-slot" type="number" min="0" max="3" step="1" value="1"></label></div><div class="button-row"><button id="ring-auto" type="button">空き段にはめる</button><button id="ring-apply" type="button">位置を更新</button><button id="ring-delete" type="button">外す</button></div><p class="hint">雄材の左右の角棒に沿って配置。雌材と同じ段・角棒の外・丸材同士の重複は拒否します。</p></details>
-<details><summary>ロープ経路</summary><label for="rope-id">編集するロープ</label><select id="rope-id"></select><div class="double"><label>A・開始<select id="route-a"></select></label><label>C・対角<select id="route-c"></select></label><label>B・隣<select id="route-b"></select></label><label>D・終端<select id="route-d"></select></label></div><div class="button-row"><button id="apply-rope" type="button">経路更新</button><button id="add-rope" type="button">経路追加</button><button id="delete-rope" type="button">削除</button></div><div class="button-row"><button id="rope-front" type="button">前面ロープだけ残す</button><button id="rope-remove" type="button">全ロープを外す</button></div><p class="hint">各面 A→C→B→D。経路・巻き取り雄材は保存ファイルにも記録します。復元は枠の作り直しかファイル読込で行えます。</p></details>
-<label for="name">設計名</label><input id="name" maxlength="200"><label for="notes">設計メモ</label><textarea id="notes" rows="3"></textarea><p class="hint">保存形式：.tsumiki.json v5<br>位置・部材・支持・ロープ・材料・解析条件を一緒に保存。</p>
-</aside>
-<aside class="panel analysis sim-only" id="sim-panel" role="tabpanel" aria-labelledby="tab-sim"><h2>荷重と揺れ</h2><label for="load-node">荷重点</label><select id="load-node"></select><label for="direction">作用方向</label><select id="direction"><option value="x">X方向</option><option value="y">Y方向</option><option value="z">Z方向</option></select><label for="force">静的・加振の外力振幅</label><input id="force" type="number" min="-2" max="2" step="0.02"><label for="torque">同軸の外力モーメント</label><input id="torque" type="number" min="-2" max="2" step="0.01"><label for="gravity">自重用の重力係数</label><input id="gravity" type="number" min="0" max="2" step="0.01"><hr><label for="base-acceleration">床の加速度振幅</label><input id="base-acceleration" type="number" min="0" max="2" step="0.01"><label for="frequency">加振周波数</label><input id="frequency" type="number" min="0.05" max="5" step="0.05"><label for="duration">計算時間</label><input id="duration" type="number" min="1" max="12" step="1"><label for="excitation-stop">加振を止める時刻</label><input id="excitation-stop" type="number" min="0.1" max="12" step="0.1"><label for="damping">相対減衰パラメータ</label><input id="damping" type="number" min="0.001" max="0.3" step="0.01"><h2 class="sub-heading">接合とロープの仮定</h2><details id="joint-settings" open><summary>接合の遊び・ロープの掛かり</summary><label for="joint-model">接合のモデル</label><select id="joint-model"><option value="clearance-contact">穴と角棒の遊び・接触</option><option value="rigid-approximation">剛接合（遊びなし・比較用）</option></select><label for="rope-wrap">ロープの掛け点（C・B）</label><select id="rope-wrap"><option value="locked">滑らない（巻き取り後に固着）</option><option value="sliding">滑る（摩擦なし・張力一様）</option></select><div class="double"><label>接触時の剛性<input id="joint-contact" type="number" min="0.001" max="10000000" step="any"></label><label>隙間内の抵抗<input id="joint-open" type="number" min="0.000001" max="10000000" step="any"></label></div><p id="joint-clearance" class="hint"></p><p class="hint">実物の掛け点の摩擦は「滑る」と「滑らない」の間にあります。両方で比べて結果の幅を確認してください。摩擦による接合の固着、遊びの実寸は未確定です。</p></details><details><summary>ロープ・材料の仮パラメータ</summary><label for="prestrain">巻き取り後の張力ひずみ（全ロープ）</label><input id="prestrain" type="number" min="0" max="0.02" step="0.001"><label for="rope-k">相対ロープ軸剛性</label><input id="rope-k" type="number" min="0.01" max="100000" step="10"><label for="slack">たるみの比率</label><input id="slack" type="number" min="0" max="0.2" step="0.005"><div id="material-inputs"></div><button id="apply-material" type="button">材料・ロープを更新</button></details><button id="calculate" class="primary" type="button">3条件を再計算</button><div class="assumptions"><h3>この計算が扱うもの</h3><p>3D弾性梁・6自由度 / 穴と角棒の隙間・接触（摩擦なし） / 引張専用ロープ（掛け点で滑る・滑らないの両極端） / 巻き取り後の張力 / 集中質量 / 静的釣り合い / 平衡点まわりの線形振動</p><h3>まだ扱わないもの</h3><p>丸材・ロープの一般干渉、移動途中・変形後の衝突、接合・掛け点の摩擦の中間値、揺れの途中での接触の開閉、床との浮き上がり、座屈、大変形、破壊。丸材は表示のみ。</p><p>補強が常に有利とは仮定しません。共振により揺れが増す場合も、そのまま表示します。</p></div><a class="format-link" href="/schemas/tsumiki-design-v5.schema.json" target="_blank" rel="noreferrer">専用形式のJSON Schema ↗</a></aside>
-<section class="center"><div class="panel viewer"><div class="viewer-head"><h2 id="viewer-title">3D WORKSPACE</h2><div><button id="fit" type="button">全体</button><button id="top" type="button">上面</button><button id="front" type="button">正面</button><button id="side" type="button">側面</button></div></div><div class="editor-toolbar model-only"><span class="model-only tool-group"><button id="move-tool" type="button" aria-pressed="false">↔ 移動</button><label>移動刻み<select id="snap"><option value="0.05">0.05</option><option value="0.1" selected>0.1</option><option value="0.25">0.25</option></select></label></span><button id="undo" type="button" disabled>↶ 元に戻す</button><button id="redo" type="button" disabled>↷ やり直す</button><label class="check"><input id="nodes-visible" type="checkbox" checked>節点</label></div><div class="selection-bar"><button id="edit-selection" class="model-only" type="button">選択を編集</button><span id="selection-summary">節点 n6</span><span id="tool-hint">図をクリックして選択 / ドラッグで視点回転 / ホイールで拡大</span></div><div id="viewport"></div><div class="viewer-footer"><span id="counts"></span><span>X 赤 / Y 上・緑 / Z 青</span></div><div class="legend model-only"><span class="male">● 雄材</span><span class="female">● 雌材</span><span class="rope">● ロープ</span><span>薄線：変形前</span><span>凸部：板厚×5（部材4＋ロープ1）</span></div></div>
-<section class="panel rope-workflow model-only" id="rope-workflow" hidden><h2>ロープを張る</h2><p class="hint">① 対応する四辺の枠を選ぶ → ② 巻き取り専用の雄材を選ぶ → ③ 張る。ロープは凸部の最外側に掛かります。</p><button id="pick-frame" type="button">① 図で枠を選ぶ</button><label for="rope-frame">対象の構造部分</label><select id="rope-frame"></select><label for="rope-winder">巻き取り用の雄材（他のロープと共用不可）</label><select id="rope-winder"></select><p id="rope-workflow-status" class="hint"></p><div class="button-row"><button id="confirm-rope" type="button" class="primary" disabled>③ ロープを張る</button><button id="cancel-rope" type="button">閉じる</button></div></section>
-<div class="panel playback sim-only"><div class="double"><label>表示ケース<select id="display-mode"><option value="taut">張力あり</option><option value="slack">たるみあり</option><option value="none">ロープなし</option></select></label><label>応答の表示<select id="display-response"><option value="static">静的荷重</option><option value="force">人による外力加振</option><option value="base">床・地面の加振</option></select></label></div><div class="play-row"><button id="play" type="button">▶ 再生</button><label class="timeline">時刻<input id="time" type="range" min="0" max="1" value="0" step="1"></label><output id="time-value">静的</output></div><label for="scale">変形の表示倍率 <output id="scale-value"></output></label><input id="scale" type="range" min="1" max="100" step="1" value="15"><p class="hint playback-note">変形は見やすく拡大しています。初期張力を含む全変位を表示します。梁の描画は節点間の直線で、曲率の詳細表示ではありません。時刻は無次元です。</p></div>
-</section>
-<div class="panel response sim-only" id="response"><div class="section-head"><h2>ロープの条件を、同じ入力で比較</h2><button id="report" type="button">↓ 解析記録</button></div><div class="table-scroll"><table><thead><tr><th>ロープ条件</th><th>静的最大変位</th><th>外力加振の最大変位</th><th>床加振の最大変位</th></tr></thead><tbody id="comparison"></tbody></table></div><p class="hint">静的変位は初期張力による変位を差し引いた荷重応答。動的変位は自重・初期張力の平衡点からの相対変位です。値は全節点の並進変位ノルムの最大。（ ）はロープなしに対する増減。</p><svg id="history" viewBox="0 0 720 180" role="img" aria-label="選択した加振に対する荷重点の相対変位時系列"></svg><div id="diagnostics" class="diagnostics"></div><h3 class="internal-heading">静的荷重時の接合の遊び（選択ロープ条件）</h3><p class="hint">使用率は穴と角棒の隙間に対する相対移動。100%以上は壁に接触（着座）。巻き取り直後→荷重時の順に表示します。行をクリックで部材を選択。</p><div class="table-scroll"><table><thead><tr><th>接合（雌材@節点）</th><th>巻き取り直後</th><th>荷重時</th><th>最大接触力</th></tr></thead><tbody id="joint-results"></tbody></table></div><h3 class="internal-heading">静的荷重時の部材端内力（選択ロープ条件）</h3><p class="hint">動的な内力・接合反力の時系列表示は未実装です。行をクリックで部材を選択。</p><div class="table-scroll"><table><thead><tr><th>部材</th><th>軸力（端部）</th><th>ねじり（端部）</th><th>曲げ合成（端部）</th></tr></thead><tbody id="member-results"></tbody></table></div></div>
-</div><footer>TSUMIKI / EXPLORATORY STRUCTURAL MODEL · 無次元の仮定モデル・部材寸法は保留中。寸法・材料は仮定値で、実物の強度・耐震性能を保証する解析ではありません。 · <a href="/rope.html">2Dの旧試作</a></footer></main>`;
+<header class="topbar"><a class="brand" href="/">▰ tsumiki</a><div class="mode-tabs" role="tablist" aria-label="作業画面"><button id="tab-model" role="tab" type="button" aria-selected="true" aria-controls="properties"><kbd>1</kbd> モデリング</button><button id="tab-sim" role="tab" type="button" aria-selected="false" aria-controls="properties" tabindex="-1"><kbd>2</kbd> シミュレーション</button></div><div class="file-actions"><button id="new-design" type="button" title="床に雌材を1枚置いた状態から始めます（元に戻せます）">＋ 新規</button><button id="recover" type="button" disabled>下書きを復元</button><button id="import" type="button">設計を読み込む</button><button id="export" class="primary" type="button">↓ 設計を保存</button><input id="file" type="file" accept=".json,.tsumiki.json" hidden></div></header>
+<main class="workspace" id="workspace" data-mode="model">
+<nav class="toolbar" aria-label="ツール"><button id="tool-select" type="button" class="tool" aria-pressed="false" aria-label="選択" title="選択（Esc）"><span aria-hidden="true">⬚</span></button><span class="model-only tool-set"><button id="move-tool" type="button" class="tool" aria-pressed="false" aria-label="移動" title="移動（G）"><span aria-hidden="true">✥</span></button><button id="tool-hole" type="button" class="tool" aria-pressed="false" aria-label="穴に雄材を差し込む" title="穴に雄材を差し込む（I）"><span aria-hidden="true">⊕</span></button><button id="tool-female" type="button" class="tool" aria-pressed="false" aria-label="雌材を追加" title="雌材を追加（Shift+A）"><span aria-hidden="true">▣</span></button><button id="tool-template" type="button" class="tool" aria-pressed="false" aria-label="テンプレートを追加" title="テンプレートを追加（T）"><span aria-hidden="true">◫</span></button><button id="rope-tool" type="button" class="tool" aria-pressed="false" aria-label="ロープを張る" title="ロープを張る（R）"><span aria-hidden="true">⟋</span></button></span></nav>
+<section class="viewer" aria-label="3Dビュー"><div class="view-header"><div class="view-group" role="group" aria-label="視点"><button id="fit" type="button" title="全体（Home）">全体</button><button id="front" type="button" title="正面（テンキー1）">正面</button><button id="side" type="button" title="側面（テンキー3）">側面</button><button id="top" type="button" title="上面（テンキー7）">上面</button></div><label class="check"><input id="nodes-visible" type="checkbox" checked>節点</label><label class="model-only snap-field">移動刻み<select id="snap"><option value="0">自由</option><option value="0.01">0.01</option><option value="0.05">0.05</option><option value="0.1" selected>0.1</option><option value="0.25">0.25</option></select></label><span class="spacer"></span><button id="delete-selection" class="model-only danger" type="button" title="選択中の部材・節点・丸材を削除（X / Delete / Backspace）">🗑 削除</button><button id="undo" type="button" disabled title="元に戻す（Ctrl+Z）">↶ 元に戻す</button><button id="redo" type="button" disabled title="やり直す（Ctrl+Shift+Z）">↷ やり直す</button></div><div class="viewport-wrap"><div id="viewport"></div><div class="view-overlay"><span id="viewer-title">設計</span><span id="selection-summary">節点 n6</span></div><div id="shortcuts" class="shortcuts" aria-label="主なショートカット"></div><div class="axis-legend">X 赤 / Y 上・緑 / Z 青</div><div class="legend model-only"><span class="male">● 雄材</span><span class="female">● 雌材</span><span class="rope">● ロープ</span><span><span id="tenon-dimensions">凸部165mm・板厚30mm</span></span></div><div class="legend sim-only"><span>薄線：変形前</span><span>変形は表示倍率で拡大</span></div><div id="error" role="alert" class="error" hidden></div></div></section>
+<aside class="sidebar"><section class="outliner" aria-label="アウトライナー"><h2>アウトライナー</h2><div id="outliner" class="outliner-tree"></div></section><section class="properties" id="properties" aria-label="プロパティ"><div class="prop-tabs" role="tablist" aria-orientation="vertical" aria-label="プロパティ"><button type="button" class="prop-tab" data-page="add" data-for="model" role="tab" aria-label="追加のプロパティ" title="追加">＋</button><button type="button" class="prop-tab" data-page="transform" data-for="model" role="tab" aria-label="配置のプロパティ" title="配置（移動・回転）">✥</button><button type="button" class="prop-tab" data-page="node" data-for="model" role="tab" aria-label="節点のプロパティ" title="節点">●</button><button type="button" class="prop-tab" data-page="member" data-for="model" role="tab" aria-label="部材のプロパティ" title="部材">▭</button><button type="button" class="prop-tab" data-page="ring" data-for="model" role="tab" aria-label="丸材のプロパティ" title="丸材">◎</button><button type="button" class="prop-tab" data-page="rope" data-for="model" role="tab" aria-label="ロープのプロパティ" title="ロープ">⟋</button><button type="button" class="prop-tab" data-page="frame" data-for="model" role="tab" aria-label="枠のプロパティ" title="枠">▦</button><button type="button" class="prop-tab" data-page="design" data-for="model" role="tab" aria-label="設計のプロパティ" title="設計">✎</button><button type="button" class="prop-tab" data-page="load" data-for="sim" role="tab" aria-label="荷重のプロパティ" title="荷重">↧</button><button type="button" class="prop-tab" data-page="shake" data-for="sim" role="tab" aria-label="揺れのプロパティ" title="揺れ">∿</button><button type="button" class="prop-tab" data-page="joint" data-for="sim" role="tab" aria-label="接合のプロパティ" title="接合">⊞</button><button type="button" class="prop-tab" data-page="material" data-for="sim" role="tab" aria-label="材料のプロパティ" title="材料">◇</button><button type="button" class="prop-tab" data-page="info" data-for="sim" role="tab" aria-label="前提のプロパティ" title="前提">ⓘ</button></div><div class="prop-pages"><section class="prop-page" id="page-add" data-page="add" data-for="model" role="tabpanel" aria-label="追加"><h2>追加</h2><div class="catalog"><p id="drawing-info" class="hint"></p><label for="drawing-start">図面から新規作成する部材</label><select id="drawing-start"></select><p class="hint">上の「＋ 新規」で選択した図面部材から始めます。</p><div id="drawing-settings"><label>凸部の角丸R（mm・仮定）<input id="tenon-radius" type="number" min="0" max="15" step="0.1" value="6.3"></label><button id="apply-tenon-radius" type="button">凸部の丸みを更新</button><p class="hint">30mm角の角丸断面は確認済み。R6.3mmは仮定値です。雌材の面取り6.3Rは未再現。力・時間は未校正です。</p></div><p class="hint">追加する部材を選んでください。雄材は雌材の穴に差し込み、雌材は雄材の角棒（節点）から伸ばします。</p><div class="button-row"><button id="palette-male" type="button" aria-pressed="true">⊣ 雄材 ⊢</button><button id="palette-female" type="button" aria-pressed="false">▣ 雌材</button><button id="palette-template" type="button" aria-pressed="false">◫ テンプレート</button></div><div id="female-add-tools" hidden><label id="female-catalog-label" for="female-catalog">雌材の図面規格（全長mm）</label><select id="female-catalog"></select><p class="hint">① 起点の節点（緑）を図でクリック → ② 向きを選ぶ → ③ 追加。半透明の板が配置プレビューです。</p><p id="female-anchor" class="anchor-line"></p><div class="direction-pad" role="group" aria-label="追加する向き"><button type="button" class="dir-button" data-dir="-x" aria-pressed="false" aria-label="−X 左へ"><span>−X 左</span><small></small></button><button type="button" class="dir-button" data-dir="x" aria-pressed="false" aria-label="+X 右へ"><span>+X 右</span><small></small></button><button type="button" class="dir-button" data-dir="-y" aria-pressed="false" aria-label="−Y 下へ"><span>−Y 下</span><small></small></button><button type="button" class="dir-button" data-dir="y" aria-pressed="false" aria-label="+Y 上へ"><span>+Y 上</span><small></small></button><button type="button" class="dir-button" data-dir="-z" aria-pressed="false" aria-label="−Z 手前へ"><span>−Z 手前</span><small></small></button><button type="button" class="dir-button" data-dir="z" aria-pressed="false" aria-label="+Z 奥へ"><span>+Z 奥</span><small></small></button></div><label for="female-tilt">傾き °（角棒まわり。斜めに出す筋交い用）</label><input id="female-tilt" type="number" min="-180" max="180" step="15" value="0"><label for="quick-length">長さ比（先に節点があれば自動で合わせます）</label><input id="quick-length" type="number" min="0.2" max="4" step="0.1" value="1"><p id="female-preview-status" class="hint"></p><button id="quick-add" class="primary" type="button" disabled>③ 雌材を追加</button><button id="connect-nodes" type="button" aria-pressed="false">2つの節点をクリックしてつなぐ</button><h3>筋交い・つなげる節点</h3><p class="hint">起点から規格の長さでちょうど届く節点です。押すとその節点まで雌材を張ります（交差する板は別の段に入ります）。</p><div id="brace-targets" class="brace-targets"></div></div><div id="template-tools" hidden><p class="hint">① 起点の雄材を図かアウトライナーでクリック（平行な2本目もクリックすると、その2本を結びます）→ ② 形・向き・大きさ → ③ 追加。半透明が配置プレビューです。</p><p id="template-males" class="anchor-line"></p><button id="template-clear" type="button">雄材の選択をやり直す</button><div class="button-row" role="group" aria-label="形"><button type="button" class="shape-button" data-shape="square" aria-pressed="true">□ 四角形</button><button type="button" class="shape-button" data-shape="triangle" aria-pressed="false">△ 三角形</button></div><div id="template-one"><h3>2本目の雄材の位置</h3><div class="direction-pad" role="group" aria-label="広げる向き"><button type="button" class="template-dir" data-dir="-x" aria-pressed="false" aria-label="−X 左へ広げる">−X 左</button><button type="button" class="template-dir" data-dir="x" aria-pressed="false" aria-label="+X 右へ広げる">+X 右</button><button type="button" class="template-dir" data-dir="-y" aria-pressed="false" aria-label="−Y 下へ広げる">−Y 下</button><button type="button" class="template-dir" data-dir="y" aria-pressed="false" aria-label="+Y 上へ広げる">+Y 上</button><button type="button" class="template-dir" data-dir="-z" aria-pressed="false" aria-label="−Z 手前へ広げる">−Z 手前</button><button type="button" class="template-dir" data-dir="z" aria-pressed="false" aria-label="+Z 奥へ広げる">+Z 奥</button></div><label for="template-size">大きさの比（雄材どうしの間隔）</label><input id="template-size" type="number" min="0.2" max="4" step="0.1" value="1"><p id="template-part" class="hint"></p><div class="button-row" role="group" aria-label="雌材の長さ"><button id="template-shorter" type="button" title="雌材を1規格短く（[）">◀ 1規格短く</button><button id="template-longer" type="button" title="雌材を1規格長く（]）">1規格長く ▶</button></div></div><div id="template-side" hidden><h3>三角形の頂点の側</h3><div class="button-row" role="group" aria-label="頂点の側"><button type="button" class="side-button" data-side="1" aria-pressed="true"></button><button type="button" class="side-button" data-side="-1" aria-pressed="false"></button></div><p class="hint">三角形の板は角棒の軸まわりに回って付きます。穴の実寸が未確定のため回転の上限は検査せず、解析では組んだ角度を中心に通常と同じ遊びがあると仮定します。</p></div><p id="template-status" class="hint"></p><button id="template-add" class="primary" type="button" disabled>③ テンプレートを追加</button></div><div id="male-add-tools"><label id="male-catalog-label" for="male-catalog">雄材の図面規格（凸部込み全長mm）</label><select id="male-catalog"></select><p class="hint">① 雌材の穴を選ぶ → ② 長さ・差し込み側 → ③ 差し込む。垂直方向と座標は自動です。</p><button id="pick-hole" type="button" aria-pressed="false">① 図の穴を選ぶ</button><label for="hole-female">差し込む雌材</label><select id="hole-female"></select><label for="hole-number">差し込む穴</label><select id="hole-number"></select><div class="double"><label>雄材の長さ比<input id="male-length" type="number" min="0.2" max="4" step="0.1" value="1.4"></label><label>差し込み側<select id="male-side"><option value="1">表側へ</option><option value="-1">裏側へ</option></select></label></div><p id="male-preview-status" class="hint">空いている穴を選択してください。</p><button id="insert-male" type="button" class="primary" disabled>③ 雄材を差し込む</button></div></div></section><section class="prop-page" id="page-transform" data-page="transform" data-for="model" role="tabpanel" aria-label="配置" hidden><h2>配置（移動・回転）</h2><h3>動かす対象</h3><div class="button-row" role="group" aria-label="動かす対象"><button type="button" class="scope-button" data-scope="selection" aria-pressed="true">選択中</button><button type="button" class="scope-button" data-scope="group" aria-pressed="false">つながり</button><button type="button" class="scope-button" data-scope="all" aria-pressed="false">構造全体（A）</button></div><p id="move-summary" class="anchor-line"></p><button type="button" id="move-constraint" aria-pressed="true" title="雄材とつながっている部分は、その軸まわりに干渉しない範囲だけ回します（C）">⛓ 接続を保って動かす（自動）</button><p id="move-constraint-status" class="hint"></p><h3>操作</h3><div class="button-row" role="group" aria-label="操作"><button type="button" class="mode-button" data-mode="translate" aria-pressed="true">✥ 移動（G）</button><button type="button" class="mode-button" data-mode="rotate" aria-pressed="false">⟳ 回転（R）</button></div><label for="rotation-snap">回転の刻み</label><select id="rotation-snap"><option value="0">自由</option><option value="5">5°</option><option value="15" selected>15°</option><option value="45">45°</option><option value="90">90°</option></select><h3>数値で動かす</h3><div class="triple"><label>ΔX<input id="move-dx" type="number" step="0.01" value="0"></label><label>ΔY<input id="move-dy" type="number" step="0.01" value="0"></label><label>ΔZ<input id="move-dz" type="number" step="0.01" value="0"></label></div><button id="apply-move" type="button">移動する</button><div class="double"><label>回転軸<select id="rotate-axis"><option value="x">X軸</option><option value="y" selected>Y軸（鉛直）</option><option value="z">Z軸</option></select></label><label>角度 °<input id="rotate-angle" type="number" step="1" value="90"></label></div><button id="apply-rotate" type="button">回転する</button><p class="hint">回転は対象の中心まわり。部材を単独で動かすと、共有していた節点から切り離します。端が他の節点に近づくと吸着し、そこで再びつながります。雄材は通った穴に自動で接続し直します。長さ・板の向きは保たれます。</p></section><section class="prop-page" id="page-node" data-page="node" data-for="model" role="tabpanel" aria-label="節点と支持" hidden><h2>節点と支持</h2><label for="node">節点（3D図でも選択可）</label><select id="node"></select><div class="triple"><label>X<input id="nx" type="number" step="0.1"></label><label>Y<input id="ny" type="number" step="0.1"></label><label>Z<input id="nz" type="number" step="0.1"></label></div><label class="check"><input id="fixed" type="checkbox">全6自由度を固定</label><button id="apply-node" type="button">節点を更新</button><div class="nudge"><button data-axis="x" data-delta="-1" type="button">−X</button><button data-axis="x" data-delta="1" type="button">+X</button><button data-axis="y" data-delta="-1" type="button">−Y</button><button data-axis="y" data-delta="1" type="button">+Y</button><button data-axis="z" data-delta="-1" type="button">−Z</button><button data-axis="z" data-delta="1" type="button">+Z</button></div><button id="delete-node" type="button">節点と接続を削除</button><div class="button-row"><button id="add-node" type="button">節点を追加</button><button id="add-ring" type="button">丸材を配置</button></div><p class="hint">丸材は雄材の角棒にはめて空き段を埋めます。接触・剛性・質量への寄与は未解析です。</p></section><section class="prop-page" id="page-member" data-page="member" data-for="model" role="tabpanel" aria-label="部材・形状" hidden><h2>部材・形状</h2><p id="member-dimensions" class="hint"></p><label for="member">部材</label><select id="member"></select><label for="kind">種類</label><select id="kind"><option value="male">雄材</option><option value="female">雌材</option></select><div class="double"><label>始点<select id="start"></select></label><label>終点<select id="end"></select></label></div><div class="triple"><label>板の回転 °<input id="member-roll" type="number" min="-180" max="180" step="90" value="0"></label><label>雌材の段<input id="member-layer" type="number" min="0" max="3" step="1" value="0"></label><label>雌材の穴数<input id="member-holes" type="number" min="2" max="32" step="1" value="7"></label></div><p class="hint">雄材・雌材の実体が重なる配置は拒否します（穴内の差し込み・面接触は許容）。段は角棒上の重ね位置。追加は空いている内側の段から。0〜3段が部材用、先端の1枚分はロープ用です。</p><div class="button-row" role="group" aria-label="重ね順"><button id="layer-out" type="button" title="1段外側へ（隣の板と入れ替え）">▲ 外側の段へ</button><button id="layer-in" type="button" title="1段内側へ（隣の板と入れ替え）">▼ 内側の段へ</button></div><div class="button-row" role="group" aria-label="規格の伸縮"><button id="board-shorter" type="button" title="1規格短く（[ / Shift+[ で反対の端）">◀ 1規格短く</button><button id="board-longer" type="button" title="1規格長く（] / Shift+] で反対の端）">1規格長く ▶</button><button id="board-end" type="button" title="端の形を 角 ⇄ 丸 に切り替え（K）">角 ⇄ 丸</button></div><button id="focus-member" type="button">この部材に寄る</button><div class="button-row"><button id="apply-member" type="button">更新</button><button id="add-member" type="button">追加</button><button id="delete-member" type="button">削除</button></div></section><section class="prop-page" id="page-ring" data-page="ring" data-for="model" role="tabpanel" aria-label="丸材・空き段" hidden><h2>丸材・空き段</h2><label for="ring-id">配置済みの丸材</label><select id="ring-id"></select><label for="ring-member">はめる雄材</label><select id="ring-member"></select><div class="double"><label>差し込み側<select id="ring-end"><option value="start">始点側</option><option value="end">終点側</option></select></label><label>はめる段<input id="ring-slot" type="number" min="0" max="3" step="1" value="1"></label></div><div class="button-row"><button id="ring-auto" type="button">空き段にはめる</button><button id="ring-apply" type="button">位置を更新</button><button id="ring-delete" type="button">外す</button></div><p class="hint">雄材の左右の角棒に沿って配置。雌材と同じ段・角棒の外・丸材同士の重複は拒否します。</p></section><section class="prop-page" id="page-rope" data-page="rope" data-for="model" role="tabpanel" aria-label="ロープ" hidden><h2>ロープ</h2><div id="rope-workflow" class="rope-workflow" hidden><h3>ロープを張る</h3><p class="hint">① 対応する四辺の枠を選ぶ → ② 巻き取り専用の雄材を選ぶ → ③ 張る。ロープは凸部の最外側に掛かります。</p><button id="pick-frame" type="button">① 図で枠を選ぶ</button><label for="rope-frame">対象の構造部分</label><select id="rope-frame"></select><label for="rope-winder">巻き取り用の雄材（他のロープと共用不可）</label><select id="rope-winder"></select><p id="rope-workflow-status" class="hint"></p><div class="button-row"><button id="confirm-rope" type="button" class="primary" disabled>③ ロープを張る</button><button id="cancel-rope" type="button">閉じる</button></div></div><h3>経路の編集</h3><label for="rope-id">編集するロープ</label><select id="rope-id"></select><div class="double"><label>A・開始<select id="route-a"></select></label><label>C・対角<select id="route-c"></select></label><label>B・隣<select id="route-b"></select></label><label>D・終端<select id="route-d"></select></label></div><div class="button-row"><button id="apply-rope" type="button">経路更新</button><button id="add-rope" type="button">経路追加</button><button id="delete-rope" type="button">削除</button></div><div class="button-row"><button id="rope-front" type="button">前面ロープだけ残す</button><button id="rope-remove" type="button">全ロープを外す</button></div><p class="hint">各面 A→C→B→D。経路・巻き取り雄材は保存ファイルにも記録します。復元は枠の作り直しかファイル読込で行えます。</p></section><section class="prop-page" id="page-frame" data-page="frame" data-for="model" role="tabpanel" aria-label="枠の構成" hidden><h2>枠の構成</h2><div class="triple"><label>幅の比<input id="width" type="number" min="0.4" max="4" step="0.1" value="1.4"></label><label>奥行の比<input id="depth" type="number" min="0.4" max="4" step="0.1" value="1"></label><label>高さの比<input id="height" type="number" min="0.4" max="4" step="0.1" value="1.2"></label></div><button id="extend-bay" type="button">奥に1区画つなぐ</button><button id="generate" type="button">比率から立体枠を作り直す</button><p class="hint">作り直すと形状・接合・ロープ・解析条件を初期化します。名称とメモは保持します。</p></section><section class="prop-page" id="page-design" data-page="design" data-for="model" role="tabpanel" aria-label="設計" hidden><h2>設計</h2><label for="name">設計名</label><input id="name" maxlength="200"><label for="notes">設計メモ</label><textarea id="notes" rows="3"></textarea><p class="hint">保存形式：.tsumiki.json v5<br>位置・部材・支持・ロープ・材料・解析条件を一緒に保存。</p></section><section class="prop-page" id="page-load" data-page="load" data-for="sim" role="tabpanel" aria-label="荷重"><h2>荷重</h2><label for="load-node">荷重点</label><select id="load-node"></select><label for="direction">作用方向</label><select id="direction"><option value="x">X方向</option><option value="y">Y方向</option><option value="z">Z方向</option></select><label for="force">静的・加振の外力振幅</label><input id="force" type="number" min="-2" max="2" step="0.02"><label for="torque">同軸の外力モーメント</label><input id="torque" type="number" min="-2" max="2" step="0.01"><label for="gravity">自重用の重力係数</label><input id="gravity" type="number" min="0" max="2" step="0.01"></section><section class="prop-page" id="page-shake" data-page="shake" data-for="sim" role="tabpanel" aria-label="揺れ・加振" hidden><h2>揺れ・加振</h2><label for="base-acceleration">床の加速度振幅</label><input id="base-acceleration" type="number" min="0" max="2" step="0.01"><label for="frequency">加振周波数</label><input id="frequency" type="number" min="0.05" max="5" step="0.05"><label for="duration">計算時間</label><input id="duration" type="number" min="1" max="12" step="1"><label for="excitation-stop">加振を止める時刻</label><input id="excitation-stop" type="number" min="0.1" max="12" step="0.1"><label for="damping">相対減衰パラメータ</label><input id="damping" type="number" min="0.001" max="0.3" step="0.01"></section><section class="prop-page" id="page-joint" data-page="joint" data-for="sim" role="tabpanel" aria-label="接合とロープの掛かり" hidden><h2>接合とロープの掛かり</h2><label for="joint-model">接合のモデル</label><select id="joint-model"><option value="clearance-contact">穴と角棒の遊び・接触</option><option value="rigid-approximation">剛接合（遊びなし・比較用）</option></select><label for="rope-wrap">ロープの掛け点（C・B）</label><select id="rope-wrap"><option value="locked">滑らない（巻き取り後に固着）</option><option value="sliding">滑る（摩擦なし・張力一様）</option></select><div class="double"><label>接触時の剛性<input id="joint-contact" type="number" min="0.001" max="10000000" step="any"></label><label>隙間内の抵抗<input id="joint-open" type="number" min="0.000001" max="10000000" step="any"></label></div><p id="joint-clearance" class="hint"></p><p class="hint">実物の掛け点の摩擦は「滑る」と「滑らない」の間にあります。両方で比べて結果の幅を確認してください。摩擦による接合の固着、遊びの実寸は未確定です。</p></section><section class="prop-page" id="page-material" data-page="material" data-for="sim" role="tabpanel" aria-label="ロープ・材料の仮パラメータ" hidden><h2>ロープ・材料の仮パラメータ</h2><label for="prestrain">巻き取り後の張力ひずみ（全ロープ）</label><input id="prestrain" type="number" min="0" max="0.02" step="0.001"><label for="rope-k">相対ロープ軸剛性</label><input id="rope-k" type="number" min="0.01" max="100000" step="10"><label for="slack">たるみの比率</label><input id="slack" type="number" min="0" max="0.2" step="0.005"><div id="material-inputs"></div><button id="apply-material" type="button">材料・ロープを更新</button></section><section class="prop-page" id="page-info" data-page="info" data-for="sim" role="tabpanel" aria-label="計算の前提" hidden><h2>計算の前提</h2><div class="assumptions"><h3>この計算が扱うもの</h3><p>3D弾性梁・6自由度 / 穴と角棒の隙間・接触（摩擦なし） / 引張専用ロープ（掛け点で滑る・滑らないの両極端） / 巻き取り後の張力 / 集中質量 / 静的釣り合い / 平衡点まわりの線形振動</p><h3>まだ扱わないもの</h3><p>丸材・ロープの一般干渉、移動途中・変形後の衝突、接合・掛け点の摩擦の中間値、揺れの途中での接触の開閉、床との浮き上がり、座屈、大変形、破壊。丸材は表示のみ。</p><p>補強が常に有利とは仮定しません。共振により揺れが増す場合も、そのまま表示します。</p></div><a class="format-link" href="/schemas/tsumiki-design-v5.schema.json" target="_blank" rel="noreferrer">専用形式のJSON Schema ↗</a></section></div></section></aside>
+<section class="timeline sim-only" id="response" aria-label="タイムラインと結果"><div class="timeline-bar"><div class="play-row"><button id="play" type="button">▶ 再生</button><label class="timeline">時刻<input id="time" type="range" min="0" max="1" value="0" step="1"></label><output id="time-value">静的</output></div><div class="timeline-fields"><label>表示ケース<select id="display-mode"><option value="taut">張力あり</option><option value="slack">たるみあり</option><option value="none">ロープなし</option></select></label><label>応答の表示<select id="display-response"><option value="static">静的荷重</option><option value="force">人による外力加振</option><option value="base">床・地面の加振</option></select></label><label class="scale-label">変形の表示倍率 <output id="scale-value"></output><input id="scale" type="range" min="1" max="100" step="1" value="15"></label></div><button id="calculate" class="primary" type="button">3条件を再計算</button><button id="report" type="button">↓ 解析記録</button></div><div class="timeline-body"><div class="chart-area" tabindex="0" role="region" aria-label="時系列と診断"><svg id="history" viewBox="0 0 720 180" role="img" aria-label="選択した加振に対する荷重点の相対変位時系列"></svg><div id="diagnostics" class="diagnostics"></div></div><div class="results-area"><div class="result-tabs" role="tablist" aria-label="結果"><button type="button" class="result-tab" role="tab" data-result="compare" aria-selected="true">ロープ条件の比較</button><button type="button" class="result-tab" role="tab" data-result="joints" aria-selected="false">接合の遊び</button><button type="button" class="result-tab" role="tab" data-result="members" aria-selected="false">部材端内力</button></div><div class="result-page" data-result="compare" tabindex="0" role="region" aria-label="ロープ条件の比較の表"><div class="table-scroll"><table><thead><tr><th>ロープ条件</th><th>静的最大変位</th><th>外力加振の最大変位</th><th>床加振の最大変位</th></tr></thead><tbody id="comparison"></tbody></table></div><p class="hint">静的変位は初期張力による変位を差し引いた荷重応答。動的変位は自重・初期張力の平衡点からの相対変位です。値は全節点の並進変位ノルムの最大。（ ）はロープなしに対する増減。</p></div><div class="result-page" data-result="joints" tabindex="0" role="region" aria-label="接合の遊びの表" hidden><h3 class="internal-heading">静的荷重時の接合の遊び（選択ロープ条件）</h3><p class="hint">使用率は穴と角棒の隙間に対する相対移動。100%以上は壁に接触（着座）。巻き取り直後→荷重時の順に表示します。行をクリックで部材を選択。</p><div class="table-scroll"><table><thead><tr><th>接合（雌材@節点）</th><th>巻き取り直後</th><th>荷重時</th><th>最大接触力</th></tr></thead><tbody id="joint-results"></tbody></table></div></div><div class="result-page" data-result="members" tabindex="0" role="region" aria-label="部材端内力の表" hidden><h3 class="internal-heading">静的荷重時の部材端内力（選択ロープ条件）</h3><p class="hint">動的な内力・接合反力の時系列表示は未実装です。行をクリックで部材を選択。</p><div class="table-scroll"><table><thead><tr><th>部材</th><th>軸力（端部）</th><th>ねじり（端部）</th><th>曲げ合成（端部）</th></tr></thead><tbody id="member-results"></tbody></table></div></div></div></div></section>
+</main>
+<footer class="statusbar"><div id="status" role="status" class="status">設計を準備中</div><span id="tool-hint" class="tool-hint"></span><span id="counts" class="counts"></span><span id="draft-status" class="draft">編集中の設計は、このブラウザにも下書き保存します。</span><span class="assume" title="図面規格は1座標単位=1000mm。材料・荷重・時間は未校正です。">形状は図面寸法／力・時間は相対値</span><a href="/rope.html">2Dの旧試作</a></footer>`;
 
 function error(message: string) {
   el("error").hidden = false;
@@ -128,11 +159,17 @@ function syncMember(focus = false) {
   input("member-roll").value = String(m.roll);
   input("member-layer").value = String(m.layer);
   input("member-holes").value = String(m.holeCount);
+  el<HTMLButtonElement>("layer-out").disabled = m.kind !== "female" || m.layer >= 3;
+  el<HTMLButtonElement>("layer-in").disabled = m.kind !== "female" || m.layer <= 0;
+  const part = memberPart(m);
+  el("member-dimensions").textContent = part
+    ? `${part.label} / 全長 ${part.totalMm} × 幅105 × 厚30 mm / ${part.kind === "male" ? "凸部165mm×両端・30mm角" : `丸穴φ39mm・${part.holes.length}穴`} / PDF ${part.page}ページ`
+    : "旧仮定モデル（実寸未対応）";
   selectedMember = m.id;
   if (focus) selected = m.end;
   if (focus) {
     selectionType = "member";
-    el<HTMLDetailsElement>("member-inspector").open = true;
+    if (!femaleMode() && !moving()) showProps("member");
     draw();
   }
 }
@@ -153,7 +190,64 @@ const fields = {
   damping: "damping",
   "excitation-stop": "excitationStop",
 } as const;
+function syncDrawingTools() {
+  const drawing = design.version === 6;
+  if (!select("drawing-start").options.length) {
+    select("drawing-start").replaceChildren(
+      ...HITOTO_PARTS.map((p) => new Option(`${p.label} · ${p.totalMm}mm`, p.id)),
+    );
+    select("drawing-start").value = "female-2400-square";
+    for (const kind of ["male", "female"] as const) {
+      select(`${kind}-catalog`).replaceChildren(
+        ...HITOTO_PARTS.filter((p) => p.kind === kind).map(
+          (p) => new Option(`${p.label} · ${p.totalMm}mm`, p.id),
+        ),
+      );
+      select(`${kind}-catalog`).value = kind === "male" ? "male-1200" : "female-1200-square";
+    }
+  }
+  el("drawing-info").textContent = drawing
+    ? "図面規格：板幅105mm・厚30mm・丸穴φ39mm。座標1=1000mm。規格の長さ・穴数を保持します。"
+    : "旧仮定モデル：寸法・角穴は旧データのまま保持しています。図面規格は「＋ 新規」から開始できます。";
+  el("drawing-settings").hidden = !drawing;
+  el("tenon-dimensions").textContent = drawing
+    ? "凸部165mm・板厚30mm（組立4段・残り45mm）"
+    : "凸部：板厚×5（部材4＋ロープ1）";
+  input("tenon-radius").value = String((design.geometry.tenonCornerRadius ?? 0) * 1000);
+  for (const kind of ["male", "female"] as const) {
+    select(`${kind}-catalog`).hidden = !drawing;
+    el(`${kind}-catalog-label`).hidden = !drawing;
+    const field = input(kind === "male" ? "male-length" : "quick-length");
+    field.readOnly = drawing;
+    const label =
+      kind === "male" ? field.closest("label") : document.querySelector('label[for="quick-length"]');
+    if (label?.firstChild?.nodeType === Node.TEXT_NODE)
+      label.firstChild.textContent = drawing
+        ? kind === "male"
+          ? "本体長（1000mm単位）"
+          : "両端の穴中心間距離（1000mm単位）"
+        : kind === "male"
+          ? "雄材の長さ比"
+          : "長さ比（先に節点があれば自動で合わせます）";
+    field.min = drawing ? "0.001" : "0.2";
+    if (drawing) field.value = String(catalogPart(select(`${kind}-catalog`).value).span);
+  }
+  input("member-holes").readOnly = drawing;
+  el<HTMLButtonElement>("generate").disabled = drawing;
+  el<HTMLButtonElement>("extend-bay").disabled = drawing;
+  el("generate").title = drawing
+    ? "図面規格は部材を選んで組み立てます。任意比率の枠は旧仮定モデル専用です"
+    : "";
+  input("template-size").readOnly = drawing;
+  if (drawing) input("template-size").value = String(catalogPart(select("female-catalog").value).span);
+  select("kind").disabled = drawing;
+  const contact = select("joint-model").querySelector<HTMLOptionElement>('option[value="clearance-contact"]');
+  if (contact) contact.disabled = drawing;
+  const schema = document.querySelector<HTMLAnchorElement>(".format-link");
+  if (schema) schema.href = `/schemas/tsumiki-design-v${design.version}.schema.json`;
+}
 function sync() {
+  syncDrawingTools();
   input("name").value = design.name;
   el<HTMLTextAreaElement>("notes").value = design.notes;
   syncHoleChoices();
@@ -207,7 +301,9 @@ function sync() {
   el("joint-clearance").textContent =
     design.jointModel === "clearance-contact"
       ? `片側の隙間 ${clearance.toPrecision(3)}（穴 ${design.geometry.holeSize} − 角棒 ${design.geometry.tenonSize}）/ 板厚 ${design.geometry.thickness}。形状の無次元仮定から計算します。`
-      : "剛接合では隙間を計算に含めません。";
+      : design.version === 6
+        ? "丸穴・角丸凸部の接触則は未校正のため、剛接合での参考比較です。材料・断面剛性・荷重・時間は従来の仮定値です。"
+        : "剛接合では隙間を計算に含めません。";
   const material = design.materials[0];
   el("material-inputs").replaceChildren();
   for (const key of ["E", "G", "A", "Iy", "Iz", "J", "density"] as const) {
@@ -221,6 +317,7 @@ function sync() {
     label.append(field);
     el("material-inputs").append(label);
   }
+  renderOutliner();
   el("counts").textContent =
     `${design.nodes.length}節点 / ${design.members.length}部材 / ${design.ropes.length}ロープ / ${design.rings.length}丸材 / ${design.connections.length}穴接続`;
 }
@@ -281,12 +378,22 @@ function draw() {
     tab === "model" ? malePreview : null,
   );
   viewport?.setFrameSelection(choosingFrame, chosenFrame);
-  viewport?.setTools(
-    tab === "model",
-    el("move-tool").getAttribute("aria-pressed") === "true" && !choosingHole && !choosingFrame,
-    Number(select("snap").value),
+  viewport?.setTools(tab === "model", moveSpec());
+  refreshFemalePreview();
+  refreshTemplatePreview();
+  viewport?.setGhosts(femalePreview ? [femalePreview.member] : (templatePreview?.created ?? []));
+  viewport?.setMarked(templateMode() ? templateMales : []);
+  viewport?.setAnchorChoices(
+    femaleMode() ? design.members.filter((m) => m.kind === "male").flatMap((m) => [m.start, m.end]) : [],
   );
-  viewport?.show(design, u, design.view.deformationScale, selectedTag, mode, input("nodes-visible").checked);
+  viewport?.show(
+    femalePreview?.design ?? templatePreview?.design ?? design,
+    u,
+    design.view.deformationScale,
+    selectedTag,
+    mode,
+    input("nodes-visible").checked,
+  );
   el("selection-summary").textContent =
     selectionType === "node"
       ? `節点 ${selected}`
@@ -294,6 +401,9 @@ function draw() {
         ? `部材 ${selectedMember}`
         : `丸材 ${selectedRing}`;
   syncHistory();
+  markOutliner();
+  updateToolbar();
+  syncMoveTool();
   chart();
   details();
 }
@@ -306,7 +416,7 @@ function chart() {
   const histories = modes.map((m) => results.get(m)?.[response as Excitation]);
   if (histories.some((v) => !v)) return;
   const max = Math.max(1e-8, ...histories.flatMap((h) => (h ? h.values.map(Math.abs) : [])));
-  let svg = '<line x1="45" y1="85" x2="700" y2="85" stroke="#aab9a5"/>';
+  let svg = '<line x1="45" y1="85" x2="700" y2="85" stroke="#5a5a5a"/>';
   const colors = ["#7e8980", "#c5a263", "#c65432"];
   histories.forEach((h, i) => {
     if (!h) return;
@@ -376,10 +486,6 @@ function calculate() {
   stop();
   clearTimeout(pendingCalculation);
   pendingCalculation = 0;
-  if (calculationError) {
-    clearError();
-    calculationError = false;
-  }
   results.clear();
   try {
     const next = new Map<
@@ -446,20 +552,23 @@ function calculate() {
     el("response").classList.remove("stale");
     el("status").textContent =
       `${actionNote ? `${actionNote} · ` : ""}計算完了 · 静的荷重・外力加振・床加振を3条件で比較しました`;
+    el("status").classList.remove("warn");
     actionNote = "";
     draw();
   } catch (e) {
     stale = false;
     el("response").classList.remove("stale");
-    calculationError = true;
     results.clear();
     el("comparison").replaceChildren();
     el("member-results").replaceChildren();
     el("joint-results").replaceChildren();
     el("history").replaceChildren();
-    el("diagnostics").textContent = "";
-    error(e instanceof Error ? e.message : String(e));
-    el("status").textContent = "計算できませんでした。設計・支持・荷重条件を確認してください。";
+    // An unfinished structure is a normal state while modelling, so report it softly instead of as an alert.
+    const reason = e instanceof Error ? e.message : String(e);
+    el("diagnostics").textContent = `まだ解析できません：${reason}`;
+    el("status").textContent = `${actionNote ? `${actionNote} · ` : ""}まだ解析できません：${reason}`;
+    el("status").classList.add("warn");
+    actionNote = "";
     draw();
   }
 }
@@ -645,23 +754,13 @@ for (const [button, action] of [
         const index = d.members.findIndex((m) => m.id === select("member").value);
         if (action === "delete") {
           if (index < 0) throw new Error("部材がありません");
-          const removed = d.members[index];
-          d.members.splice(index, 1);
-          d.rings = d.rings.filter((r) => r.member !== removed.id);
-          d.ropes = d.ropes.filter(
-            (r) =>
-              r.windingMember !== removed.id &&
-              [r.route[1], r.route[2]].sort().join(":") !== [removed.start, removed.end].sort().join(":"),
-          );
+          removeMember(d, d.members[index].id);
           return;
         }
         const kind = select("kind").value as "male" | "female";
         if (action === "add" && kind === "male")
           throw new Error("雄材は穴を選ぶ操作から追加してください。方向・座標は自動で決まります");
-        const outer =
-          action === "add" && kind === "female"
-            ? nextOuterLayer(d, [select("start").value, select("end").value])
-            : Number(input("member-layer").value);
+        const layer = Number(input("member-layer").value);
         const member = {
           id: action === "add" ? id("m") : select("member").value,
           kind: select("kind").value as "male" | "female",
@@ -669,13 +768,35 @@ for (const [button, action] of [
           end: select("end").value,
           material: action === "update" && index >= 0 ? d.members[index].material : d.materials[0].id,
           roll: Number(input("member-roll").value),
-          layer: outer,
+          layer,
           holeCount: Number(input("member-holes").value),
+          ...(d.version === 6
+            ? { catalogId: action === "update" ? d.members[index].catalogId : select("female-catalog").value }
+            : {}),
         };
-        if (action === "add") d.members.push(member);
+        if (action === "add" && kind === "female") placeBoard(d, member);
+        else if (action === "add") d.members.push(member);
         else if (index >= 0) d.members[index] = member;
       }),
     ),
+  );
+for (const [button, delta] of [
+  ["layer-out", 1],
+  ["layer-in", -1],
+] as const)
+  el(button).addEventListener("click", () =>
+    guard(() => {
+      const member = select("member").value;
+      let swapped: string[] = [];
+      update((d) => {
+        swapped = shiftLayer(d, member, delta);
+      });
+      actionNote = `雌材 ${member} を${delta > 0 ? "外側" : "内側"}の段へ（${swapped.length}枚の段を入れ替え）`;
+      el("status").textContent = `${actionNote}。再計算しています…`;
+      selectionType = "member";
+      viewport?.pulse(swapped);
+      draw();
+    }),
   );
 el("rope-front").addEventListener("click", () =>
   guard(() =>
@@ -871,18 +992,6 @@ el("recover").addEventListener("click", () =>
     calculate();
   }),
 );
-el("edit-selection").addEventListener("click", () => {
-  setTab("model");
-  const id =
-    selectionType === "member"
-      ? "member-inspector"
-      : selectionType === "ring"
-        ? "ring-inspector"
-        : "node-inspector";
-  const panel = el<HTMLDetailsElement>(id);
-  panel.open = true;
-  panel.scrollIntoView({ block: "center", behavior: "smooth" });
-});
 function syncHistory() {
   el<HTMLButtonElement>("undo").disabled = !history.canUndo;
   el<HTMLButtonElement>("redo").disabled = !history.canRedo;
@@ -894,6 +1003,414 @@ function restoreHistory(kind: "undo" | "redo") {
     markDirty();
     sync();
   });
+}
+const defaultHints = {
+  model:
+    "クリックで選択 · ドラッグで回転 · G 移動 · I 穴に差し込む · Shift+A 雌材 · T テンプレート · R ロープ · X 削除 · Home 全体 · テンキー1/3/7 視点 · 2 シミュレーション",
+  sim: "Space 再生・停止 · クリックで部材を選択 · Home 全体 · テンキー1/3/7 視点 · 1 モデリング",
+} as const;
+const lastPage: Record<"model" | "sim", string> = { model: "add", sim: "load" };
+/** Show a properties page. Pages that belong to the other screen are ignored. */
+function showProps(page: string) {
+  const target = document.getElementById(`page-${page}`);
+  if (!target || target.dataset.for !== tab) return;
+  lastPage[tab] = page;
+  for (const section of document.querySelectorAll<HTMLElement>(".prop-page"))
+    section.hidden = section.dataset.page !== page;
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".prop-tab")) {
+    const active = button.dataset.page === page;
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+  }
+}
+for (const button of document.querySelectorAll<HTMLButtonElement>(".prop-tab"))
+  button.addEventListener("click", () => showProps(button.dataset.page ?? ""));
+el("properties")
+  .querySelector(".prop-tabs")
+  ?.addEventListener("keydown", (event) => {
+    const key = (event as KeyboardEvent).key;
+    if (key !== "ArrowDown" && key !== "ArrowUp") return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll<HTMLButtonElement>(`.prop-tab[data-for="${tab}"]`)];
+    const index = tabs.findIndex((t) => t.dataset.page === lastPage[tab]);
+    const next = tabs[(index + (key === "ArrowDown" ? 1 : tabs.length - 1)) % tabs.length];
+    showProps(next.dataset.page ?? "");
+    next.focus();
+  });
+for (const button of document.querySelectorAll<HTMLButtonElement>(".result-tab"))
+  button.addEventListener("click", () => {
+    for (const other of document.querySelectorAll<HTMLButtonElement>(".result-tab"))
+      other.setAttribute("aria-selected", String(other === button));
+    for (const section of document.querySelectorAll<HTMLElement>(".result-page"))
+      section.hidden = section.dataset.result !== button.dataset.result;
+  });
+function cancelTools(message = "") {
+  choosingHole = false;
+  choosingFrame = false;
+  connectStart = null;
+  el("pick-hole").setAttribute("aria-pressed", "false");
+  el("connect-nodes").setAttribute("aria-pressed", "false");
+  el("move-tool").setAttribute("aria-pressed", "false");
+  el("tool-hint").textContent = message || defaultHints[tab];
+  draw();
+}
+/** The tool the keyboard and the shortcut list currently act for. */
+type ToolState = "sim" | "move" | "rope" | "connect" | "template" | "female" | "hole" | "board" | "select";
+function toolState(): ToolState {
+  if (tab === "sim") return "sim";
+  if (moving()) return "move";
+  if (!el("rope-workflow").hidden && lastPage.model === "rope") return "rope";
+  if (connectStart) return "connect";
+  if (lastPage.model === "add" && palette === "template") return "template";
+  if (lastPage.model === "add" && palette === "female") return "female";
+  if (choosingHole) return "hole";
+  if (selectionType === "member" && design.members.find((m) => m.id === selectedMember)?.kind === "female")
+    return "board";
+  return "select";
+}
+/** Button Enter presses in each tool. */
+const confirmButton: Partial<Record<ToolState, string>> = {
+  hole: "insert-male",
+  female: "quick-add",
+  template: "template-add",
+  rope: "confirm-rope",
+};
+const shortcutSets: Record<ToolState, [string, string][]> = {
+  sim: [
+    ["Space", "再生・停止"],
+    ["Home", "全体"],
+    ["テンキー1/3/7", "視点"],
+    ["Ctrl+Z", "元に戻す"],
+    ["1", "モデリング"],
+  ],
+  move: [
+    ["G", "移動"],
+    ["R", "回転"],
+    ["A", "構造全体 ⇄ 選択中"],
+    ["C", "接続を保つ ⇄ 自由"],
+    ["X / Del", "削除"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "移動をやめる"],
+  ],
+  hole: [
+    ["クリック", "穴を選ぶ"],
+    ["F", "差し込み側を反転"],
+    ["Enter", "雄材を差し込む"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "やめる"],
+  ],
+  female: [
+    ["クリック", "起点の節点"],
+    ["C", "2つの節点をつなぐ（筋交い）"],
+    ["Q / E", "傾き −15° / +15°"],
+    ["[ / ]", "雌材 1規格 短く / 長く"],
+    ["K", "雌材の端 角 ⇄ 丸"],
+    ["Enter", "雌材を追加"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "やめる"],
+  ],
+  connect: [
+    ["クリック", "つなぐ先の節点"],
+    ["Esc", "つなぐのをやめる"],
+  ],
+  template: [
+    ["クリック", "起点の雄材（2本目で結ぶ）"],
+    ["S", "四角形 ⇄ 三角形"],
+    ["F", "三角形の頂点の側を反転"],
+    ["[ / ]", "雌材 1規格 短く / 長く"],
+    ["K", "雌材の端 角 ⇄ 丸"],
+    ["Enter", "テンプレートを追加"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "やめる"],
+  ],
+  rope: [
+    ["クリック", "ロープを張る枠"],
+    ["Enter", "ロープを張る"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "閉じる"],
+  ],
+  board: [
+    ["クリック", "選択"],
+    ["[ / ]", "1規格 短く / 長く"],
+    ["Shift+[ / ]", "反対の端を伸縮"],
+    ["K", "端の形 角 ⇄ 丸"],
+    ["G", "移動・回転"],
+    ["X / Del", "削除"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Esc", "解除"],
+  ],
+  select: [
+    ["クリック", "選択"],
+    ["G", "移動・回転"],
+    ["I", "穴に差し込む"],
+    ["Shift+A", "雌材"],
+    ["T", "テンプレート"],
+    ["R", "ロープ"],
+    ["X / Del", "削除"],
+    ["Ctrl+Z", "元に戻す"],
+    ["Home", "全体"],
+    ["Esc", "解除"],
+  ],
+};
+/** Main shortcuts for the current screen and tool, always shown at the bottom left of the view. */
+function renderShortcuts() {
+  const state = toolState();
+  const box = el("shortcuts");
+  if (box.dataset.state === state) return;
+  box.dataset.state = state;
+  box.replaceChildren(
+    ...shortcutSets[state].map(([key, label]) => {
+      const row = document.createElement("span");
+      const kbd = document.createElement("kbd");
+      kbd.textContent = key;
+      row.append(kbd, label);
+      return row;
+    }),
+  );
+}
+/** Whether focus last moved with Tab rather than a pointer, so Enter should stay with the focused button. */
+let focusFromKeyboard = false;
+document.addEventListener("pointerdown", () => {
+  focusFromKeyboard = false;
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Tab") focusFromKeyboard = true;
+});
+/** Shortens (−1) or extends (+1) the selected female by one drawing size; `flip` moves the other end. */
+function resizeSelectedBoard(step: 1 | -1, flip = false) {
+  guard(() => {
+    let label = "";
+    update((d) => {
+      label = resizeBoard(d, selectedMember, step, flip).label;
+    });
+    actionNote = `雌材 ${selectedMember} を ${label} にしました`;
+    sync();
+    draw();
+    viewport?.pulse([selectedMember]);
+  });
+}
+/**
+ * Steps the size of new boards: the next drawing size of the same end shape, or 0.1 of the size ratio in
+ * legacy designs. Used by the template and female tools.
+ */
+function stepNewBoardSize(step: 1 | -1) {
+  guard(() => {
+    if (palette === "template" && templateMales.length >= 2)
+      throw new Error("2本の雄材を結ぶときは、雄材どうしの間隔で雌材の長さが決まります");
+    if (design.version !== 6) {
+      const field = input(palette === "template" ? "template-size" : "quick-length");
+      const next = Math.round((Number(field.value) + step * 0.1) * 10) / 10;
+      if (next < 0.2 || next > 4) throw new Error("大きさの比は0.2〜4です");
+      field.value = String(next);
+      draw();
+      return;
+    }
+    const catalog = select("female-catalog");
+    const part = nextFemaleSize(catalog.value, step);
+    catalog.value = part.id;
+    catalog.dispatchEvent(new Event("change"));
+    el("tool-hint").textContent = `雌材を${part.label}にしました`;
+  });
+}
+el("template-shorter").addEventListener("click", () => stepNewBoardSize(-1));
+el("template-longer").addEventListener("click", () => stepNewBoardSize(1));
+/** Switches the selected female between its square and round end. */
+function toggleSelectedBoardEnd() {
+  guard(() => {
+    let label = "";
+    update((d) => {
+      label = toggleBoardEnd(d, selectedMember).label;
+    });
+    actionNote = `雌材 ${selectedMember} を ${label} にしました`;
+    sync();
+    draw();
+    viewport?.pulse([selectedMember]);
+  });
+}
+el("board-end").addEventListener("click", toggleSelectedBoardEnd);
+el("board-shorter").addEventListener("click", () => resizeSelectedBoard(-1));
+el("board-longer").addEventListener("click", () => resizeSelectedBoard(1));
+/** Keys that only mean something inside the current tool. Returns true when the key was handled. */
+function toolKey(event: KeyboardEvent): boolean {
+  const state = toolState();
+  const key = event.key.toLowerCase();
+  const confirm = confirmButton[state];
+  // Enter on a button reached with Tab keeps activating that button; after a click it confirms the tool.
+  const focusedButton = event.target instanceof HTMLButtonElement && focusFromKeyboard;
+  if (event.key === "Enter" && confirm && !focusedButton) {
+    event.preventDefault();
+    const button = el<HTMLButtonElement>(confirm);
+    if (button.disabled) el("tool-hint").textContent = "まだ追加できません。パネルの説明を確認してください";
+    else button.click();
+    return true;
+  }
+  if (state === "board" && "[]{}".includes(event.key) && event.key.length === 1) {
+    event.preventDefault();
+    resizeSelectedBoard("]}".includes(event.key) ? 1 : -1, event.shiftKey);
+    return true;
+  }
+  if (event.shiftKey) return false;
+  if (state === "board" && key === "k") {
+    toggleSelectedBoardEnd();
+    return true;
+  }
+  if ((state === "template" || state === "female") && (event.key === "[" || event.key === "]")) {
+    event.preventDefault();
+    stepNewBoardSize(event.key === "]" ? 1 : -1);
+    return true;
+  }
+  if (state === "female" && (key === "q" || key === "e")) {
+    const tilt = input("female-tilt");
+    const next = Number(tilt.value) + (key === "e" ? 15 : -15);
+    tilt.value = String(((((next + 180) % 360) + 360) % 360) - 180);
+    draw();
+    return true;
+  }
+  if (state === "hole" && key === "f") {
+    const side = select("male-side");
+    side.value = side.value === "1" ? "-1" : "1";
+    side.dispatchEvent(new Event("change"));
+    return true;
+  }
+  if (state === "female" && key === "c") {
+    el("connect-nodes").click();
+    draw();
+    return true;
+  }
+  if ((state === "female" || state === "template") && key === "k") {
+    toggleFemaleEnd();
+    return true;
+  }
+  if (state === "template" && key === "s") {
+    document.querySelector<HTMLButtonElement>('.shape-button[aria-pressed="false"]')?.click();
+    return true;
+  }
+  if (state === "template" && key === "f" && templateShape === "triangle") {
+    document.querySelector<HTMLButtonElement>('.side-button[aria-pressed="false"]')?.click();
+    return true;
+  }
+  return false;
+}
+function updateToolbar() {
+  const moving = el("move-tool").getAttribute("aria-pressed") === "true";
+  renderShortcuts();
+  const roping = !el("rope-workflow").hidden && lastPage.model === "rope";
+  el("tool-hole").setAttribute("aria-pressed", String(choosingHole));
+  el("tool-female").setAttribute("aria-pressed", String(palette === "female" && lastPage.model === "add"));
+  el("tool-template").setAttribute(
+    "aria-pressed",
+    String(palette === "template" && lastPage.model === "add"),
+  );
+  el("rope-tool").setAttribute("aria-pressed", String(roping));
+  el("tool-select").setAttribute(
+    "aria-pressed",
+    String(!moving && !choosingHole && !roping && !(palette !== "male" && lastPage.model === "add")),
+  );
+}
+function outlinerItem(kind: string, id: string, label: string) {
+  const item = document.createElement("button");
+  item.type = "button";
+  item.className = "outliner-item";
+  item.dataset.kind = kind;
+  item.dataset.id = id;
+  item.textContent = label;
+  return item;
+}
+function renderOutliner() {
+  const groups: [string, HTMLButtonElement[]][] = [
+    [
+      "雄材",
+      design.members
+        .filter((m) => m.kind === "male")
+        .map((m) => outlinerItem("member", m.id, `${m.id}  ${m.start}→${m.end}`)),
+    ],
+    [
+      "雌材",
+      design.members
+        .filter((m) => m.kind === "female")
+        .map((m) => outlinerItem("member", m.id, `${m.id}  ${m.holeCount}穴 · ${m.layer}段`)),
+    ],
+    ["ロープ", design.ropes.map((r) => outlinerItem("rope", r.id, `${r.id}  巻き取り ${r.windingMember}`))],
+    ["丸材", design.rings.map((r) => outlinerItem("ring", r.id, `${r.id}  ${r.member} · ${r.slot}段`))],
+    ["節点", design.nodes.map((n) => outlinerItem("node", n.id, `${n.id}${n.fixed ? "  固定" : ""}`))],
+  ];
+  el("outliner").replaceChildren(
+    ...groups
+      .filter(([, items]) => items.length)
+      .map(([title, items]) => {
+        const group = document.createElement("details");
+        group.open = title !== "節点";
+        const summary = document.createElement("summary");
+        summary.textContent = `${title}（${items.length}）`;
+        group.append(summary, ...items);
+        return group;
+      }),
+  );
+  markOutliner();
+}
+function markOutliner() {
+  const current =
+    selectionType === "member"
+      ? `member:${selectedMember}`
+      : selectionType === "ring"
+        ? `ring:${selectedRing}`
+        : `node:${selected}`;
+  for (const item of el("outliner").querySelectorAll<HTMLElement>(".outliner-item"))
+    item.classList.toggle("is-selected", `${item.dataset.kind}:${item.dataset.id}` === current);
+}
+el("outliner").addEventListener("click", (event) => {
+  const item = event.target instanceof Element ? event.target.closest<HTMLElement>(".outliner-item") : null;
+  const id = item?.dataset.id;
+  if (!item || !id) return;
+  if (item.dataset.kind === "member" && templateMode()) {
+    pickTemplateMale(id);
+  } else if (item.dataset.kind === "member") {
+    select("member").value = id;
+    syncMember(true);
+  } else if (item.dataset.kind === "node") {
+    selected = id;
+    selectionType = "node";
+    syncNode();
+    showProps("node");
+  } else if (item.dataset.kind === "ring") {
+    viewport?.onRingSelect(id);
+  } else if (item.dataset.kind === "rope") {
+    select("rope-id").value = id;
+    syncRope();
+    showProps("rope");
+  }
+  markOutliner();
+});
+el("outliner").addEventListener("mouseover", (event) => {
+  const item = event.target instanceof Element ? event.target.closest<HTMLElement>(".outliner-item") : null;
+  viewport?.setHover(item?.dataset.kind === "member" ? (item.dataset.id ?? "") : "");
+});
+el("outliner").addEventListener("mouseleave", () => viewport?.setHover(""));
+el("tool-select").addEventListener("click", () => {
+  el("rope-workflow").hidden = true;
+  cancelTools();
+});
+el("tool-hole").addEventListener("click", () => {
+  setTab("model");
+  showProps("add");
+  el("pick-hole").click();
+});
+el("tool-template").addEventListener("click", () => {
+  setTab("model");
+  showProps("add");
+  el("palette-template").click();
+});
+el("tool-female").addEventListener("click", () => {
+  setTab("model");
+  showProps("add");
+  el("palette-female").click();
+});
+el("delete-selection").addEventListener("click", () => deleteSelection());
+function deleteSelection() {
+  if (tab !== "model") return;
+  if (selectionType === "member") el("delete-member").click();
+  else if (selectionType === "ring") el("ring-delete").click();
+  else el("delete-node").click();
 }
 function setTab(next: "model" | "sim") {
   if (tab === next) return;
@@ -913,14 +1430,13 @@ function setTab(next: "model" | "sim") {
     connectStart = null;
     el("pick-hole").setAttribute("aria-pressed", "false");
     el("connect-nodes").setAttribute("aria-pressed", "false");
+    el("move-tool").setAttribute("aria-pressed", "false");
     // Show results immediately instead of waiting for the debounce.
     if (pendingCalculation) calculate();
   }
-  el("viewer-title").textContent = next === "model" ? "3D WORKSPACE · 設計" : "3D WORKSPACE · 解析結果";
-  el("tool-hint").textContent =
-    next === "model"
-      ? "図をクリックして選択 / ドラッグで視点回転 / ホイールで拡大"
-      : "変形は表示倍率で拡大 / Space で再生・停止 / 部材クリックで結果の行を強調";
+  showProps(lastPage[next]);
+  el("viewer-title").textContent = next === "model" ? "設計" : "解析結果";
+  el("tool-hint").textContent = defaultHints[next];
   draw();
 }
 el("tab-model").addEventListener("click", () => setTab("model"));
@@ -942,32 +1458,71 @@ document.addEventListener("keydown", (event) => {
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
     event.preventDefault();
     if (event.shiftKey ? history.canRedo : history.canUndo) restoreHistory(event.shiftKey ? "redo" : "undo");
+    return;
   }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "y") {
     event.preventDefault();
     if (history.canRedo) restoreHistory("redo");
+    return;
   }
-  if (!event.ctrlKey && !event.metaKey && !event.altKey) {
-    if (event.key === "1") setTab("model");
-    if (event.key === "2") setTab("sim");
-    if (event.key === " " && tab === "sim" && !(event.target instanceof HTMLButtonElement)) {
+  if (event.ctrlKey || event.metaKey || event.altKey) return;
+  // Numpad keys move the camera like Blender; the digit row switches screens.
+  const views: Record<string, () => void> = {
+    Numpad1: () => viewport?.viewFront(),
+    Numpad3: () => viewport?.viewSide(),
+    Numpad7: () => viewport?.viewTop(),
+    Home: () => viewport?.fit(),
+    NumpadDecimal: () => viewport?.focusMember(selectedMember),
+  };
+  const view = views[event.code];
+  if (view) {
+    event.preventDefault();
+    view();
+    return;
+  }
+  if (event.code === "Digit1") setTab("model");
+  else if (event.code === "Digit2") setTab("sim");
+  else if (event.key === " " && tab === "sim" && !(event.target instanceof HTMLButtonElement)) {
+    event.preventDefault();
+    el("play").click();
+  } else if (tab === "model" && toolKey(event)) {
+    // Handled by the active tool.
+  } else if (tab === "model") {
+    const key = event.key.toLowerCase();
+    if ((key === "g" || key === "r") && moving()) {
+      moveMode = key === "g" ? "translate" : "rotate";
+      showProps("transform");
+      draw();
+    } else if (key === "c" && !event.shiftKey && moving()) {
+      el("move-constraint").click();
+    } else if (key === "a" && !event.shiftKey && moving()) {
+      moveScope = moveScope === "all" ? "selection" : "all";
+      draw();
+    } else if (key === "g") el("move-tool").click();
+    else if (key === "i") el("tool-hole").click();
+    else if (key === "a" && event.shiftKey) el("tool-female").click();
+    else if (key === "r") el("rope-tool").click();
+    else if (key === "t") el("tool-template").click();
+    else if (key === "x" || event.key === "Delete" || event.key === "Backspace") {
       event.preventDefault();
-      el("play").click();
+      deleteSelection();
     }
   }
   if (event.key === "Escape") {
-    choosingHole = false;
-    choosingFrame = false;
-    el("pick-hole").setAttribute("aria-pressed", "false");
-    connectStart = null;
-    el("connect-nodes").setAttribute("aria-pressed", "false");
-    el("tool-hint").textContent = "選択操作を解除しました";
-    draw();
+    // Esc steps back once: from connecting nodes to the female tool, from any tool to selection.
+    if (connectStart) {
+      el("connect-nodes").click();
+      draw();
+      return;
+    }
+    el("rope-workflow").hidden = true;
+    if (palette !== "male") el("palette-male").click();
+    cancelTools("選択操作を解除しました");
   }
 });
-let palette: "male" | "female" = "male";
-function paletteKind() {
-  return palette;
+let palette: "male" | "female" | "template" = "male";
+function paletteKind(): "male" | "female" {
+  return palette === "female" ? "female" : "male";
 }
 function nextMemberId(d: Design) {
   let n = 0;
@@ -975,43 +1530,371 @@ function nextMemberId(d: Design) {
     n++;
   return `m${n}`;
 }
-for (const kind of ["male", "female"] as const)
+for (const kind of ["male", "female", "template"] as const)
   el(`palette-${kind}`).addEventListener("click", () => {
     palette = kind;
-    for (const k of ["male", "female"]) el(`palette-${k}`).setAttribute("aria-pressed", String(k === kind));
-    el("quick-anchor").hidden = kind !== "female";
+    for (const k of ["male", "female", "template"])
+      el(`palette-${k}`).setAttribute("aria-pressed", String(k === kind));
     el("male-add-tools").hidden = kind !== "male";
     el("female-add-tools").hidden = kind !== "female";
+    el("template-tools").hidden = kind !== "template";
+    if (kind === "template") {
+      choosingHole = false;
+      malePreview = null;
+      const picked = design.members.find((m) => m.id === selectedMember && m.kind === "male");
+      templateMales = selectionType === "member" && picked ? [picked.id] : [];
+      el("tool-hint").textContent =
+        "起点の雄材をクリックしてください。平行な2本目もクリックすると、その2本を結びます";
+    }
     connectStart = null;
     el("connect-nodes").setAttribute("aria-pressed", "false");
     if (kind === "female") {
       choosingHole = false;
       malePreview = null;
+      selectionType = "node";
+      el("tool-hint").textContent = "緑の節点（雄材の角棒）をクリックして起点を選び、向きを選んでください";
     } else refreshMalePreview();
     draw();
-    if (kind === "male" && !select("quick-direction").value.includes("x"))
-      select("quick-direction").value = "x";
-    if (kind === "female" && select("quick-direction").value === "x") select("quick-direction").value = "y";
   });
+let femaleDirection: AxisDirection = "y";
+let femaleChoice = "";
+let femalePreview: { design: Design; member: string } | null = null;
+const femaleMode = () => tab === "model" && palette === "female" && lastPage.model === "add";
+/** Direction of the new board: the picked axis turned by the tilt about the shaft of the male at the anchor. */
+function femaleVector(d: Design, anchor: string): Vec3 {
+  const base: Vec3 = [...AXIS_DIRECTIONS[femaleDirection]];
+  const tilt = Number(input("female-tilt").value);
+  if (!Number.isFinite(tilt)) throw new Error("傾きは数値で入力してください");
+  if (Math.abs(tilt) < 1e-9) return base;
+  const host = d.members.find((m) => m.kind === "male" && (m.start === anchor || m.end === anchor));
+  const a = d.nodes.find((n) => n.id === host?.start)?.position;
+  const b = d.nodes.find((n) => n.id === host?.end)?.position;
+  if (!a || !b) throw new Error("傾けるには雄材の角棒の節点を起点に選んでください");
+  return rotate3(base, [b[0] - a[0], b[1] - a[1], b[2] - a[2]], tilt);
+}
+/** Brace candidates are costly (a collision check each), so they are kept until the design or inputs change. */
+let braceCache: { design: Design; key: string; targets: ReturnType<typeof braceTargets> } | null = null;
+function renderBraceTargets(anchor: string | undefined) {
+  const box = el("brace-targets");
+  const preferred = design.version === 6 ? select("female-catalog").value : undefined;
+  const key = `${anchor}:${preferred}`;
+  if (!anchor) {
+    braceCache = null;
+    box.replaceChildren(
+      Object.assign(document.createElement("p"), {
+        className: "hint",
+        textContent: "起点の節点を選ぶと表示します。",
+      }),
+    );
+    return;
+  }
+  if (braceCache?.design === design && braceCache.key === key) return;
+  const targets = braceTargets(design, anchor, preferred);
+  braceCache = { design, key, targets };
+  if (!targets.length) {
+    box.replaceChildren(
+      Object.assign(document.createElement("p"), {
+        className: "hint",
+        textContent: "規格の長さでちょうど届く節点がありません。傾きを付けて先端を新しい節点にできます。",
+      }),
+    );
+    return;
+  }
+  box.replaceChildren(
+    ...targets.map((t) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "brace-target";
+      b.dataset.node = t.node;
+      b.textContent = `${t.diagonal ? "╱ 筋交い" : "─"} → ${t.node}${t.label ? `（${t.label}）` : `（長さ ${t.length}）`}`;
+      b.addEventListener("click", () => addBoardBetween(anchor, t.node));
+      return b;
+    }),
+  );
+}
+/** Adds a board straight between two nodes (a brace when they are diagonal) and selects it. */
+function addBoardBetween(start: string, end: string) {
+  guard(() => {
+    let member = "";
+    update((d) => {
+      member = connectBoard(d, start, end, d.version === 6 ? select("female-catalog").value : undefined);
+    });
+    selectedMember = member;
+    actionNote = `雌材 ${member} を ${start}–${end} に張りました`;
+    sync();
+    draw();
+    viewport?.pulse([member]);
+  });
+}
+/** Recompute the translucent female preview from the anchor node, direction and length. */
+function refreshFemalePreview() {
+  femalePreview = null;
+  const button = el<HTMLButtonElement>("quick-add");
+  button.disabled = true;
+  if (!femaleMode()) return;
+  const anchor = design.nodes.find((n) => n.id === selected);
+  const host = design.members.find((m) => m.kind === "male" && (m.start === selected || m.end === selected));
+  el("female-anchor").textContent = anchor
+    ? `起点：${anchor.id}${host ? `（雄材 ${host.id} の${host.start === anchor.id ? "始点" : "終点"}側の角棒）` : "（雄材の角棒ではありません）"}`
+    : "起点：未選択";
+  renderBraceTargets(anchor?.id);
+  const options = anchor ? femaleDirections(design, anchor.id) : [];
+  const current = options.find((o) => o.direction === femaleDirection);
+  if (current?.blocked) {
+    const fallback = options.find((o) => !o.blocked && o.target) ?? options.find((o) => !o.blocked);
+    if (fallback) femaleDirection = fallback.direction;
+  }
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".dir-button")) {
+    const option = options.find((o) => o.direction === b.dataset.dir);
+    b.disabled = !option || !!option.blocked;
+    b.title =
+      option?.blocked ??
+      (option?.target ? `${option.target.node} までつなぐ（長さ ${option.target.length}）` : "");
+    b.setAttribute("aria-pressed", String(b.dataset.dir === femaleDirection && !b.disabled));
+    const note = b.querySelector("small");
+    if (note) note.textContent = option?.target ? `→ ${option.target.node}` : "";
+  }
+  const chosen = options.find((o) => o.direction === femaleDirection);
+  // Snap the length once per anchor/direction choice so manual edits are kept afterwards.
+  const choice = `${selected}:${femaleDirection}`;
+  if (choice !== femaleChoice) {
+    femaleChoice = choice;
+    if (chosen?.target && design.version !== 6) input("quick-length").value = String(chosen.target.length);
+  }
+  if (!anchor || !chosen || chosen.blocked) {
+    el("female-preview-status").textContent = anchor
+      ? "この節点から伸ばせる向きがありません。"
+      : "図で起点の節点をクリックしてください。";
+    return;
+  }
+  try {
+    const draft = structuredClone(design);
+    const result = appendMember(
+      draft,
+      anchor.id,
+      "female",
+      femaleVector(design, anchor.id),
+      Number(input("quick-length").value),
+      design.version === 6 ? select("female-catalog").value : undefined,
+    );
+    const valid = parseDesign(serializeDesign(draft));
+    const member = valid.members.find((m) => m.id === result.memberId);
+    femalePreview = { design: valid, member: result.memberId };
+    button.disabled = false;
+    const reached = design.nodes.some((n) => n.id === result.nodeId);
+    el("female-preview-status").textContent =
+      `${member?.layer ?? 0}段目に重ねます。${reached ? `${result.nodeId} とつなぎます。` : "先端は新しい節点になります。"}`;
+  } catch (e) {
+    el("female-preview-status").textContent = e instanceof Error ? e.message : String(e);
+  }
+}
+for (const b of document.querySelectorAll<HTMLButtonElement>(".dir-button"))
+  b.addEventListener("click", () => {
+    femaleDirection = b.dataset.dir as AxisDirection;
+    draw();
+  });
+input("quick-length").addEventListener("input", draw);
+input("female-tilt").addEventListener("input", draw);
+let templateMales: string[] = [];
+let templateShape: TemplateShape = "square";
+let templateDirection: AxisDirection | null = null;
+let templateSide: 1 | -1 = 1;
+let templatePreview: { design: Design; created: string[] } | null = null;
+const templateMode = () => tab === "model" && palette === "template" && lastPage.model === "add";
+const axisName = (v: number[]) => {
+  const names = [
+    ["+X 右", "−X 左"],
+    ["+Y 上", "−Y 下"],
+    ["+Z 奥", "−Z 手前"],
+  ];
+  const axis = [0, 1, 2].reduce((best, i) => (Math.abs(v[i]) > Math.abs(v[best]) ? i : best), 0);
+  return names[axis][v[axis] >= 0 ? 0 : 1];
+};
+function pickTemplateMale(id: string) {
+  const member = design.members.find((m) => m.id === id);
+  if (member?.kind !== "male") {
+    el("tool-hint").textContent = "テンプレートの起点には雄材を選んでください";
+    return;
+  }
+  // Clicking a picked male releases it only when two are picked, so re-clicking the sole base is harmless.
+  if (!templateMales.includes(id)) templateMales = [...templateMales, id].slice(-2);
+  else if (templateMales.length > 1) templateMales = templateMales.filter((m) => m !== id);
+  draw();
+}
+/** Recompute the translucent template preview from the picked males, shape, direction and size. */
+/** End shape of the template's boards: the one picked in the female catalog (drawing designs only). */
+function templateFemaleEnd() {
+  return design.version === 6 ? catalogPart(select("female-catalog").value).end : undefined;
+}
+/** Switches the female catalog between the square (角) and round (丸) end of the same size. */
+function toggleFemaleEnd() {
+  if (design.version !== 6) {
+    el("tool-hint").textContent = "角・丸の切り替えは図面規格の設計で使えます";
+    return;
+  }
+  const catalog = select("female-catalog");
+  const next = catalog.value.includes("-square")
+    ? catalog.value.replace("-square", "-round")
+    : catalog.value.replace("-round", "-square");
+  catalogPart(next);
+  catalog.value = next;
+  catalog.dispatchEvent(new Event("change"));
+  el("tool-hint").textContent = `雌材を${catalogPart(next).label}に切り替えました`;
+}
+function refreshTemplatePreview() {
+  templatePreview = null;
+  const button = el<HTMLButtonElement>("template-add");
+  button.disabled = true;
+  if (!templateMode()) return;
+  templateMales = templateMales.filter((id) => design.members.some((m) => m.id === id && m.kind === "male"));
+  el("template-males").textContent = templateMales.length
+    ? `起点：雄材 ${templateMales.join("・")}${templateMales.length === 1 ? "（平行な2本目もクリックできます）" : ""}`
+    : "起点：未選択（雄材をクリック）";
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".shape-button"))
+    b.setAttribute("aria-pressed", String(b.dataset.shape === templateShape));
+  const one = templateMales.length === 1;
+  el("template-one").hidden = !one;
+  const part = design.version === 6 ? catalogPart(select("female-catalog").value) : undefined;
+  el("template-part").textContent = part
+    ? `雌材：${part.label}（穴中心間 ${Math.round(part.span * 10000) / 10}mm）`
+    : "";
+  el("template-side").hidden = templateShape !== "triangle" || templateMales.length === 0;
+  const allowed = one ? templateDirections(design, templateMales[0]) : [];
+  if (one && (!templateDirection || !allowed.includes(templateDirection)))
+    templateDirection = allowed.includes("y") ? "y" : (allowed[0] ?? null);
+  for (const b of document.querySelectorAll<HTMLButtonElement>(".template-dir")) {
+    const ok = allowed.includes(b.dataset.dir as AxisDirection);
+    b.disabled = !ok;
+    b.title = ok ? "" : "雄材と同じ向きには広げられません";
+    b.setAttribute("aria-pressed", String(ok && b.dataset.dir === templateDirection));
+  }
+  if (templateMales.length === 0) {
+    el("template-status").textContent = "図かアウトライナーで雄材をクリックしてください。";
+    return;
+  }
+  const request = {
+    shape: templateShape,
+    males: templateMales,
+    direction: templateDirection ?? undefined,
+    size: Number(input("template-size").value),
+    side: templateSide,
+    femaleEnd: templateFemaleEnd(),
+  };
+  try {
+    if (templateShape === "triangle") {
+      const apex = apexDirection(design, request);
+      for (const b of document.querySelectorAll<HTMLButtonElement>(".side-button")) {
+        const side = Number(b.dataset.side) as 1 | -1;
+        b.textContent = `${axisName(apex.map((v) => v * side))}側`;
+        b.setAttribute("aria-pressed", String(side === templateSide));
+      }
+    }
+    const draft = structuredClone(design);
+    const { created } = addTemplate(draft, request);
+    templatePreview = { design: parseDesign(serializeDesign(draft)), created };
+    button.disabled = false;
+    const males = created.filter(
+      (id) => templatePreview?.design.members.find((m) => m.id === id)?.kind === "male",
+    );
+    el("template-status").textContent =
+      `雄材${males.length}本・雌材${created.length - males.length}枚を追加します。`;
+  } catch (e) {
+    el("template-status").textContent = e instanceof Error ? e.message : String(e);
+  }
+}
+for (const b of document.querySelectorAll<HTMLButtonElement>(".shape-button"))
+  b.addEventListener("click", () => {
+    templateShape = b.dataset.shape as TemplateShape;
+    draw();
+  });
+for (const b of document.querySelectorAll<HTMLButtonElement>(".template-dir"))
+  b.addEventListener("click", () => {
+    templateDirection = b.dataset.dir as AxisDirection;
+    draw();
+  });
+for (const b of document.querySelectorAll<HTMLButtonElement>(".side-button"))
+  b.addEventListener("click", () => {
+    templateSide = Number(b.dataset.side) as 1 | -1;
+    draw();
+  });
+input("template-size").addEventListener("input", draw);
+el("template-clear").addEventListener("click", () => {
+  templateMales = [];
+  draw();
+});
+el("template-add").addEventListener("click", () =>
+  guard(() => {
+    if (!templatePreview) throw new Error("テンプレートの条件を確認してください");
+    const created = templatePreview.created;
+    const request = {
+      shape: templateShape,
+      males: templateMales,
+      direction: templateDirection ?? undefined,
+      size: Number(input("template-size").value),
+      side: templateSide,
+      femaleEnd: templateFemaleEnd(),
+    };
+    update((d) => {
+      addTemplate(d, request);
+    });
+    actionNote = `${templateShape === "triangle" ? "三角形" : "四角形"}のテンプレートを追加しました`;
+    templateMales = [];
+    sync();
+    draw();
+    viewport?.fitIfOutside(
+      design.members.filter((m) => created.includes(m.id)).flatMap((m) => [m.start, m.end]),
+    );
+    viewport?.pulse(created);
+  }),
+);
 el("quick-add").addEventListener("click", () =>
   guard(() => {
     let target = selected;
     let member = selectedMember;
     update((d) => {
-      const value = select("quick-direction").value;
-      const axis = value.endsWith("x") ? 0 : value.endsWith("y") ? 1 : 2;
-      const direction: [number, number, number] = [0, 0, 0];
-      direction[axis] = value.startsWith("-") ? -1 : 1;
-      const result = appendMember(d, selected, paletteKind(), direction, Number(input("quick-length").value));
+      const result = appendMember(
+        d,
+        selected,
+        "female",
+        femaleVector(d, selected),
+        Number(input("quick-length").value),
+        d.version === 6 ? select("female-catalog").value : undefined,
+      );
       target = result.nodeId;
       member = result.memberId;
     });
     selected = target;
     selectedMember = member;
-    selectionType = "member";
+    selectionType = "node";
+    actionNote = `雌材 ${member} を追加しました`;
     sync();
     draw();
+    viewport?.fitIfOutside([target]);
     viewport?.pulse([member]);
+  }),
+);
+el("new-design").addEventListener("click", () =>
+  guard(() => {
+    const next = createDrawingDesign(select("drawing-start").value);
+    history.push(design, next);
+    design = next;
+    persistDraft();
+    selected = "n0";
+    selectedMember = "m0";
+    selectionType = "member";
+    setTab("model");
+    showProps("add");
+    el("palette-male").click();
+    actionNote = "新規作成：床に雌材を1枚置きました。穴を選んで雄材を差し込んでください";
+    markDirty();
+    sync();
+    select("hole-female").value = "m0";
+    syncHoleNumbers();
+    refreshMalePreview();
+    choosingHole = true;
+    el("pick-hole").setAttribute("aria-pressed", "true");
+    viewport?.fit();
+    draw();
   }),
 );
 el("connect-nodes").addEventListener("click", () => {
@@ -1036,21 +1919,209 @@ for (const button of document.querySelectorAll<HTMLButtonElement>(".nudge button
         const axis = { x: 0, y: 1, z: 2 }[button.dataset.axis as "x" | "y" | "z"];
         node.position[axis] =
           Math.round(
-            (node.position[axis] + Number(button.dataset.delta) * Number(select("snap").value)) * 1e6,
+            (node.position[axis] + Number(button.dataset.delta) * (Number(select("snap").value) || 0.01)) *
+              1e6,
           ) / 1e6;
         selectionType = "node";
       }),
     ),
   );
+function moving() {
+  return tab === "model" && el("move-tool").getAttribute("aria-pressed") === "true";
+}
+/** The target the move tool acts on, from the scope buttons and the current selection. */
+function moveTarget(): { target: MoveTarget; id: string } | null {
+  if (moveScope === "all") return design.members.length ? { target: "all", id: "" } : null;
+  const member =
+    selectionType === "member"
+      ? selectedMember
+      : (design.members.find((m) => m.start === selected || m.end === selected)?.id ?? "");
+  if (moveScope === "group") return member ? { target: "group", id: member } : null;
+  if (selectionType === "node")
+    return design.nodes.some((n) => n.id === selected) ? { target: "node", id: selected } : null;
+  if (selectionType === "member") return { target: "member", id: selectedMember };
+  return null;
+}
+/** How the joints restrict the current move target (always free when joints are not kept). */
+function moveConstraint() {
+  const chosen = moveTarget();
+  if (!chosen || !keepJoints) return { kind: "free" as const };
+  const constraint = jointConstraint(design, chosen.target, chosen.id);
+  if (constraint.kind !== "hinge") return constraint;
+  const key = `${chosen.target}:${chosen.id}`;
+  if (hingeCache?.design !== design || hingeCache.key !== key)
+    hingeCache = { design, key, sweep: new HingeSweep(design, chosen.target, chosen.id, constraint.hinge) };
+  return { ...constraint, sweep: hingeCache.sweep };
+}
+function moveSpec(): TransformSpec | null {
+  if (!moving() || choosingHole || choosingFrame || femalePreview || templatePreview) return null;
+  const chosen = moveTarget();
+  if (!chosen) return null;
+  const constraint = moveConstraint();
+  if (constraint.kind === "locked") return null;
+  if (constraint.kind === "hinge") {
+    const parts = targetParts(design, chosen.target, chosen.id);
+    return {
+      mode: "rotate",
+      pivot: constraint.hinge.pivot,
+      nodes: parts.nodes,
+      members: parts.members,
+      all: false,
+      snap: 0,
+      rotationSnap: Number(select("rotation-snap").value),
+      hinge: { axis: constraint.hinge.axis, limit: (angle) => constraint.sweep.limit(angle) },
+    };
+  }
+  const parts = targetParts(design, chosen.target, chosen.id);
+  if (!parts.nodes.length) return null;
+  return {
+    mode: chosen.target === "node" ? "translate" : moveMode,
+    pivot: pivotOf(design, parts.nodes),
+    nodes: parts.nodes,
+    members: parts.members,
+    all: chosen.target === "all",
+    snap: Number(select("snap").value),
+    rotationSnap: Number(select("rotation-snap").value),
+  };
+}
+function targetName(target: MoveTarget) {
+  return {
+    node: "節点",
+    member: "部材（単独）",
+    group: "つながった部分",
+    all: "構造全体",
+  }[target];
+}
+function syncMoveTool() {
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".scope-button"))
+    button.setAttribute("aria-pressed", String(button.dataset.scope === moveScope));
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".mode-button"))
+    button.setAttribute("aria-pressed", String(button.dataset.mode === moveMode));
+  const chosen = moveTarget();
+  const parts = chosen ? targetParts(design, chosen.target, chosen.id) : null;
+  el("move-summary").textContent =
+    chosen && parts
+      ? `${targetName(chosen.target)}${chosen.id ? ` ${chosen.id}` : ""} · 部材${parts.members.length} · 節点${parts.nodes.length}`
+      : "対象を図かアウトライナーで選んでください";
+  const constraint = moveConstraint();
+  // On a hinge only turning is possible; show the operation that actually happens.
+  for (const button of document.querySelectorAll<HTMLButtonElement>(".mode-button")) {
+    const mode = constraint.kind === "hinge" ? "rotate" : moveMode;
+    button.setAttribute("aria-pressed", String(button.dataset.mode === mode));
+    button.disabled =
+      constraint.kind === "locked" || (constraint.kind === "hinge" && button.dataset.mode === "translate");
+  }
+  el("move-constraint").setAttribute("aria-pressed", String(keepJoints));
+  el("move-constraint").textContent = keepJoints ? "⛓ 接続を保って動かす（自動）" : "✥ 自由に動かす";
+  el("move-constraint-status").textContent =
+    constraint.kind === "hinge"
+      ? `雄材とつながっているため、その角棒の軸まわりにだけ回します（接続${constraint.joints}か所）。干渉する手前で止まります。`
+      : constraint.kind === "locked"
+        ? `別々の軸の雄材${constraint.joints}か所に固定されているため動かせません。C で自由に動かせます（接続は外れます）。`
+        : keepJoints
+          ? "雄材とはつながっていないので自由に動かせます。"
+          : "接続を気にせず動かします。離れた接続は外れます。";
+  el<HTMLButtonElement>("apply-rotate").disabled =
+    !chosen || chosen.target === "node" || constraint.kind === "locked";
+  el<HTMLButtonElement>("apply-move").disabled = constraint.kind !== "free";
+  if (moving())
+    el("tool-hint").textContent =
+      constraint.kind === "hinge"
+        ? "輪をドラッグして角棒まわりに回転（干渉の手前で停止）· C 自由 · Esc 終了"
+        : constraint.kind === "locked"
+          ? "固定されています · C で自由に動かす · Esc 終了"
+          : moveMode === "rotate"
+            ? "色付きの輪をドラッグして回転 · G 移動 · A 全体 · Esc 終了"
+            : "矢印をドラッグして移動（近くの節点に吸着）· R 回転 · A 全体 · Esc 終了";
+}
+function applyMotion(motion: {
+  translate: [number, number, number];
+  axis: [number, number, number];
+  angle: number;
+}) {
+  const chosen = moveTarget();
+  if (!chosen) throw new Error("動かす対象を選んでください");
+  const parts = targetParts(design, chosen.target, chosen.id);
+  let pivot = pivotOf(design, parts.nodes);
+  let result: ReturnType<typeof moveParts> = { nodes: [], droppedRopes: [] };
+  actionNote = `${targetName(chosen.target)}を${Math.abs(motion.angle) > 1e-9 ? "回転" : "移動"}しました`;
+  const constraint = moveConstraint();
+  if (constraint.kind === "locked")
+    throw new Error("雄材に固定されているため動かせません。C で自由に動かせます");
+  if (constraint.kind === "hinge") {
+    if (Math.hypot(...motion.translate) > 1e-9)
+      throw new Error("雄材とつながった部分は角棒の軸まわりにだけ回せます");
+    // Numeric angles come with their own axis; on a hinge the shaft decides the axis and the sweep the range.
+    const along = Math.sign(motion.axis.reduce((sum, v, i) => sum + v * constraint.hinge.axis[i], 0)) || 1;
+    const wanted = motion.angle * along;
+    const angle = constraint.sweep.limit(wanted);
+    if (Math.abs(angle) < 1e-9) throw new Error("この向きには干渉するため回せません");
+    motion = { ...motion, axis: constraint.hinge.axis, angle };
+    pivot = constraint.hinge.pivot;
+    actionNote = `${targetName(chosen.target)}を角棒まわりに${Math.round(angle * 10) / 10}°回転しました${Math.abs(angle - wanted) > 1e-6 ? "（干渉の手前で止めました）" : ""}`;
+  }
+  try {
+    update((d) => {
+      result = moveParts(d, chosen.target, chosen.id, { ...motion, pivot });
+    });
+  } catch (e) {
+    actionNote = "";
+    throw e;
+  }
+  if (chosen.target === "node" && result.nodes[0]) selected = result.nodes[0];
+  if (result.droppedRopes.length) {
+    actionNote += `（ロープ${result.droppedRopes.length}本を外しました）`;
+    el("status").textContent = `${actionNote}。再計算しています…`;
+  }
+  viewport?.pulse(parts.members);
+}
 el("move-tool").addEventListener("click", () => {
   const on = el("move-tool").getAttribute("aria-pressed") !== "true";
   el("move-tool").setAttribute("aria-pressed", String(on));
-  selectionType = "node";
-  el("tool-hint").textContent = on
-    ? "色付き矢印をドラッグして節点を移動（刻みにスナップ）"
-    : "ドラッグで視点回転 / 部材をクリックで選択";
+  if (on) {
+    choosingHole = false;
+    showProps("transform");
+  } else el("tool-hint").textContent = defaultHints.model;
   draw();
 });
+for (const button of document.querySelectorAll<HTMLButtonElement>(".scope-button"))
+  button.addEventListener("click", () => {
+    moveScope = button.dataset.scope as typeof moveScope;
+    draw();
+  });
+for (const button of document.querySelectorAll<HTMLButtonElement>(".mode-button"))
+  button.addEventListener("click", () => {
+    moveMode = button.dataset.mode as typeof moveMode;
+    draw();
+  });
+select("rotation-snap").addEventListener("change", draw);
+el("move-constraint").addEventListener("click", () => {
+  keepJoints = !keepJoints;
+  draw();
+});
+el("apply-move").addEventListener("click", () =>
+  guard(() =>
+    applyMotion({
+      translate: [
+        Number(input("move-dx").value),
+        Number(input("move-dy").value),
+        Number(input("move-dz").value),
+      ],
+      axis: [0, 1, 0],
+      angle: 0,
+    }),
+  ),
+);
+el("apply-rotate").addEventListener("click", () =>
+  guard(() => {
+    const axis = select("rotate-axis").value;
+    applyMotion({
+      translate: [0, 0, 0],
+      axis: [axis === "x" ? 1 : 0, axis === "y" ? 1 : 0, axis === "z" ? 1 : 0],
+      angle: Number(input("rotate-angle").value),
+    });
+  }),
+);
 select("snap").addEventListener("change", draw);
 input("nodes-visible").addEventListener("change", draw);
 el("front").addEventListener("click", () => viewport?.viewFront());
@@ -1075,7 +2146,7 @@ function addRing() {
   selectedRing = ringId;
   selectionType = "ring";
   sync();
-  el<HTMLDetailsElement>("ring-inspector").open = true;
+  showProps("ring");
   draw();
 }
 select("ring-id").addEventListener("change", () => {
@@ -1137,6 +2208,20 @@ function syncHoleNumbers(preferred?: number) {
           )[0];
   select("hole-number").value = candidate === undefined ? "" : String(candidate);
 }
+for (const kind of ["male", "female"] as const)
+  select(`${kind}-catalog`).addEventListener("change", () => {
+    syncDrawingTools();
+    refreshMalePreview();
+    draw();
+  });
+el("apply-tenon-radius").addEventListener("click", () =>
+  guard(() =>
+    update((d) => {
+      if (d.version !== 6) throw new Error("図面規格の設計で変更してください");
+      d.geometry.tenonCornerRadius = Number(input("tenon-radius").value) / 1000;
+    }),
+  ),
+);
 function refreshMalePreview() {
   malePreview = null;
   el<HTMLButtonElement>("insert-male").disabled = true;
@@ -1184,6 +2269,7 @@ input("male-length").addEventListener("input", () => {
   draw();
 });
 el("pick-hole").addEventListener("click", () => {
+  showProps("add");
   el("rope-workflow").hidden = true;
   chosenFrame = "";
   palette = "male";
@@ -1224,6 +2310,7 @@ el("insert-male").addEventListener("click", () =>
     actionNote = "穴に垂直に差し込み、通過する雌材との構造接続を保存しました";
     sync();
     draw();
+    viewport?.fitIfOutside(design.members.filter((m) => m.id === member).flatMap((m) => [m.start, m.end]));
     viewport?.pulse([member, ...design.connections.filter((c) => c.male === member).map((c) => c.female)]);
   }),
 );
@@ -1260,6 +2347,8 @@ function syncRopeWorkflow() {
   el<HTMLButtonElement>("confirm-rope").disabled = !select("rope-winder").value;
 }
 function startRopeTool() {
+  setTab("model");
+  showProps("rope");
   select("hole-female").value = "";
   select("hole-number").replaceChildren();
   refreshMalePreview();
@@ -1325,16 +2414,10 @@ el("cancel-rope").addEventListener("click", () => {
 });
 try {
   viewport = new Viewport(el("viewport"));
-  viewport.onMoveNode = (id, position) =>
+  viewport.onTransform = (motion) =>
     guard(() => {
-      selected = id;
-      selectionType = "node";
       try {
-        update((d) => {
-          const node = d.nodes.find((n) => n.id === id);
-          if (!node) throw new Error("節点がありません");
-          node.position = position.map((v) => Math.round(v * 1e6) / 1e6) as [number, number, number];
-        });
+        applyMotion(motion);
       } finally {
         draw();
       }
@@ -1355,6 +2438,10 @@ try {
     draw();
   };
   viewport.onMemberSelect = (id) => {
+    if (templateMode()) {
+      pickTemplateMale(id);
+      return;
+    }
     const member = design.members.find((m) => m.id === id);
     if (member?.kind === "female" && paletteKind() === "male") {
       select("hole-female").value = id;
@@ -1369,35 +2456,40 @@ try {
     select("ring-id").value = id;
     syncRing();
     selectionType = "ring";
-    el<HTMLDetailsElement>("ring-inspector").open = true;
+    showProps("ring");
     draw();
   };
   viewport.onSelect = (id) => {
     selected = id;
     selectionType = "node";
+    if (!femaleMode() && !moving()) showProps("node");
     if (connectStart) {
       const start = connectStart;
       connectStart = null;
       el("connect-nodes").setAttribute("aria-pressed", "false");
-      guard(() =>
-        update((d) => {
-          if (start === id) throw new Error("異なる2節点を選んでください");
-          const a = d.nodes.find((n) => n.id === start);
-          const b = d.nodes.find((n) => n.id === id);
-          if (!a || !b) throw new Error("節点がありません");
-          const length = Math.hypot(...a.position.map((v, i) => v - b.position[i]));
-          d.members.push({
-            id: nextMemberId(d),
-            kind: paletteKind(),
-            start,
-            end: id,
-            material: d.materials[0].id,
-            roll: paletteKind() === "female" ? 90 : 0,
-            layer: paletteKind() === "female" ? nextOuterLayer(d, [start, id]) : 0,
-            holeCount: Math.max(2, Math.min(7, Math.floor(length / (d.geometry.holeSize * 1.5)) + 1)),
-          });
-        }),
-      );
+      if (paletteKind() === "female") addBoardBetween(start, id);
+      else
+        guard(() =>
+          update((d) => {
+            if (start === id) throw new Error("異なる2節点を選んでください");
+            const a = d.nodes.find((n) => n.id === start);
+            const b = d.nodes.find((n) => n.id === id);
+            if (!a || !b) throw new Error("節点がありません");
+            const length = Math.hypot(...a.position.map((v, i) => v - b.position[i]));
+            const member: Member = {
+              id: nextMemberId(d),
+              kind: paletteKind(),
+              start,
+              end: id,
+              material: d.materials[0].id,
+              roll: paletteKind() === "female" ? boardRoll(d, start, id) : 0,
+              layer: 0,
+              holeCount: Math.max(2, Math.min(7, Math.floor(length / (d.geometry.holeSize * 1.5)) + 1)),
+            };
+            if (member.kind === "female") placeBoard(d, member);
+            else d.members.push(member);
+          }),
+        );
     }
     syncNode();
   };
@@ -1410,5 +2502,7 @@ try {
   error(`下書きの確認に失敗しました: ${String(e)}`);
 }
 sync();
+showProps("add");
+el("tool-hint").textContent = defaultHints.model;
 viewport?.fit();
 requestAnimationFrame(() => calculate());

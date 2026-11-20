@@ -6,6 +6,28 @@ import { femaleGeometry, femaleLayerSign, maleGeometry, memberFrame, ringGeometr
 import { holeOccupied, holeSite } from "./holes";
 import { detectRopeFrames, type RopeFrame, ropeAttachments } from "./rope";
 
+/** What the move gizmo drags: its pivot, the parts that follow it live, and the snapping. */
+export type TransformSpec = {
+  mode: "translate" | "rotate";
+  pivot: Vec3;
+  nodes: string[];
+  members: string[];
+  /** Every drawn object follows (whole structure). */
+  all: boolean;
+  /** Translation step (0 = free). */
+  snap: number;
+  /** Rotation step in degrees (0 = free). */
+  rotationSnap: number;
+  /**
+   * Constrained rotation about one line (e.g. a board turning on the tenon through its hole): only the
+   * ring about `axis` is shown and `limit` returns the angle the drag may actually reach.
+   */
+  hinge?: { axis: Vec3; limit: (angle: number) => number };
+};
+export type GizmoMotion = { translate: Vec3; axis: Vec3; angle: number; pivot: Vec3 };
+/** Moving ends closer than this to a node that stays put jump onto it. */
+const MAGNET = 0.06;
+
 export class Viewport {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
@@ -17,12 +39,15 @@ export class Viewport {
   private targets: THREE.Object3D[] = [];
   private current: Design | null = null;
   private editing = true;
-  private move = false;
+  private spec: TransformSpec | null = null;
+  private followers: { object: THREE.Object3D; position: THREE.Vector3; quaternion: THREE.Quaternion }[] = [];
+  /** Gizmo orientation before the drag; a hinge turns the gizmo so its Z ring lies about the hinge axis. */
+  private base = new THREE.Quaternion();
   onSelect: (id: string) => void = () => {};
   onMemberSelect: (id: string) => void = () => {};
   onRingSelect: (id: string) => void = () => {};
-  onMoveNode: (id: string, position: Vec3) => void = () => {};
-  private selectedNode = "";
+  /** Called once when a gizmo drag ends with a non-zero motion. */
+  onTransform: (motion: GizmoMotion) => void = () => {};
   private choosingFrame = false;
   private selectedFrame = "";
   onFrameSelect: (id: string) => void = () => {};
@@ -31,6 +56,21 @@ export class Viewport {
   private chosenHole: { female: string; hole: number } | null = null;
   private preview: { start: Vec3; end: Vec3 } | null = null;
   private hovered = "";
+  private ghosts = new Set<string>();
+  private marked = new Set<string>();
+  private anchors = new Set<string>();
+  /** Members drawn as a translucent placement preview (not pickable). */
+  setGhosts(members: string[]) {
+    this.ghosts = new Set(members);
+  }
+  /** Members picked as the base of the active tool; they glow softly until released. */
+  setMarked(members: string[]) {
+    this.marked = new Set(members);
+  }
+  /** Nodes offered as starting points for the active tool. */
+  setAnchorChoices(nodes: string[]) {
+    this.anchors = new Set(nodes);
+  }
   private pulseIds = new Set<string>();
   private pulseStart = 0;
   /** Temporarily emphasise a member, e.g. while its result row is hovered. */
@@ -51,7 +91,11 @@ export class Viewport {
       if (!member || !(target instanceof THREE.Mesh)) continue;
       const material = target.material;
       if (!(material instanceof THREE.MeshStandardMaterial)) continue;
-      const intensity = Math.max(this.pulseIds.has(member) ? flash : 0, member === this.hovered ? 0.35 : 0);
+      const intensity = Math.max(
+        this.pulseIds.has(member) ? flash : 0,
+        member === this.hovered ? 0.35 : 0,
+        this.marked.has(member) ? 0.5 : 0,
+      );
       material.emissive.setHex(0xffb347);
       material.emissiveIntensity = intensity;
     }
@@ -72,7 +116,7 @@ export class Viewport {
   constructor(private host: HTMLElement) {
     this.renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.renderer.setClearColor("#edf1e8");
+    this.renderer.setClearColor("#3a3a3a");
     this.renderer.domElement.setAttribute(
       "aria-label",
       "3D設計。ドラッグで視点回転。部材・節点をクリックして選択。移動モードでは矢印で節点を動かせます。",
@@ -87,7 +131,7 @@ export class Viewport {
     const light = new THREE.DirectionalLight(0xffffff, 3);
     light.position.set(3, 6, 4);
     this.scene.add(light);
-    const grid = new THREE.GridHelper(12, 48, 0x9bad97, 0xd3ddcc);
+    const grid = new THREE.GridHelper(12, 48, 0x5e5e5e, 0x474747);
     grid.position.y = -0.3;
     this.scene.add(grid);
     this.scene.add(this.group);
@@ -97,13 +141,17 @@ export class Viewport {
     this.scene.add(axes);
     this.transform = new TransformControls(this.camera, this.renderer.domElement);
     this.transform.setMode("translate");
-    this.transform.setTranslationSnap(0.05);
     this.scene.add(this.transform.getHelper());
     this.transform.addEventListener("dragging-changed", (event) => {
       this.controls.enabled = !event.value;
     });
+    this.transform.addEventListener("mouseDown", () => this.collectFollowers());
+    this.transform.addEventListener("objectChange", () => this.dragUpdate());
     this.transform.addEventListener("mouseUp", () => {
-      if (this.selectedNode) this.onMoveNode(this.selectedNode, this.anchor.position.toArray() as Vec3);
+      const motion = this.currentMotion();
+      this.followers = [];
+      if (motion && (Math.hypot(...motion.translate) > 1e-9 || Math.abs(motion.angle) > 1e-9))
+        this.onTransform(motion);
     });
     let sx = 0;
     let sy = 0;
@@ -151,11 +199,112 @@ export class Viewport {
       this.renderer.render(this.scene, this.camera);
     });
   }
-  setTools(editing: boolean, move: boolean, snap: number) {
+  setTools(editing: boolean, spec: TransformSpec | null) {
     this.editing = editing;
-    this.move = move;
-    this.transform.setTranslationSnap(snap);
-    if (!editing || !move) this.transform.detach();
+    this.spec = editing ? spec : null;
+    // Translation is snapped relative to the start (see dragUpdate); rotation uses the gizmo's own snap.
+    this.transform.setTranslationSnap(null);
+    this.transform.setRotationSnap(spec?.rotationSnap ? (spec.rotationSnap * Math.PI) / 180 : null);
+    if (spec) this.transform.setMode(spec.mode);
+    const hinge = this.spec?.hinge;
+    this.transform.setSpace(hinge ? "local" : "world");
+    this.transform.showX = !hinge;
+    this.transform.showY = !hinge;
+    this.base = hinge
+      ? new THREE.Quaternion().setFromUnitVectors(
+          new THREE.Vector3(0, 0, 1),
+          new THREE.Vector3(...hinge.axis).normalize(),
+        )
+      : new THREE.Quaternion();
+    if (!this.spec) this.transform.detach();
+  }
+  private collectFollowers() {
+    const spec = this.spec;
+    if (!spec || !this.current) return;
+    const members = new Set(spec.members);
+    const nodes = new Set(spec.nodes);
+    const rings = new Set(this.current.rings.filter((r) => members.has(r.member)).map((r) => r.id));
+    this.followers = [];
+    for (const object of this.group.children) {
+      const tag = object.userData;
+      if (
+        spec.all ||
+        members.has(tag.member) ||
+        members.has(tag.female) ||
+        nodes.has(tag.node) ||
+        rings.has(tag.ring)
+      )
+        this.followers.push({
+          object,
+          position: object.position.clone(),
+          quaternion: object.quaternion.clone(),
+        });
+    }
+  }
+  private dragUpdate() {
+    const spec = this.spec;
+    if (!spec || !this.transform.dragging) return;
+    const pivot = new THREE.Vector3(...spec.pivot);
+    if (spec.mode === "translate") {
+      const delta = this.anchor.position.clone().sub(pivot);
+      if (spec.snap > 0) delta.divideScalar(spec.snap).round().multiplyScalar(spec.snap);
+      this.magnet(delta);
+      this.anchor.position.copy(pivot).add(delta);
+    }
+    if (spec.hinge) {
+      // Keep the drag on the hinge and inside the range that does not collide.
+      this.anchor.position.copy(pivot);
+      const axis = new THREE.Vector3(...spec.hinge.axis).normalize();
+      const turn = this.turn();
+      const signed = 2 * Math.atan2(new THREE.Vector3(turn.x, turn.y, turn.z).dot(axis), turn.w);
+      const allowed = (spec.hinge.limit((signed * 180) / Math.PI) * Math.PI) / 180;
+      this.anchor.quaternion.setFromAxisAngle(axis, allowed).multiply(this.base);
+    }
+    const delta = this.anchor.position.clone().sub(pivot);
+    const turn = this.turn();
+    for (const f of this.followers) {
+      f.object.position.copy(f.position).sub(pivot).applyQuaternion(turn).add(pivot).add(delta);
+      f.object.quaternion.copy(turn).multiply(f.quaternion);
+    }
+  }
+  /** Pull the moving nodes onto the nearest node that stays in place, so parts can be joined by dragging. */
+  private magnet(delta: THREE.Vector3) {
+    const spec = this.spec;
+    if (!spec || spec.all || !this.current) return;
+    const moving = this.current.nodes.filter((n) => spec.nodes.includes(n.id));
+    const still = this.current.nodes.filter((n) => !spec.nodes.includes(n.id));
+    let best: THREE.Vector3 | null = null;
+    let bestDistance = MAGNET;
+    for (const a of moving) {
+      const p = new THREE.Vector3(...a.position).add(delta);
+      for (const b of still) {
+        const q = new THREE.Vector3(...b.position);
+        const distance = p.distanceTo(q);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = q.sub(new THREE.Vector3(...a.position));
+        }
+      }
+    }
+    if (best) delta.copy(best);
+  }
+  /** Rotation of the gizmo since the drag started. */
+  private turn() {
+    return this.anchor.quaternion.clone().multiply(this.base.clone().invert());
+  }
+  private currentMotion(): GizmoMotion | null {
+    const spec = this.spec;
+    if (!spec) return null;
+    const translate = this.anchor.position
+      .clone()
+      .sub(new THREE.Vector3(...spec.pivot))
+      .toArray() as Vec3;
+    const q = this.turn().normalize();
+    if (q.w < 0) q.set(-q.x, -q.y, -q.z, -q.w);
+    const angle = 2 * Math.acos(Math.min(1, q.w));
+    const s = Math.sin(angle / 2);
+    const axis: Vec3 = s > 1e-9 ? [q.x / s, q.y / s, q.z / s] : [0, 1, 0];
+    return { translate, axis, angle: (angle * 180) / Math.PI, pivot: spec.pivot };
   }
   private resize() {
     const w = this.host.clientWidth;
@@ -182,11 +331,23 @@ export class Viewport {
     tag: { member?: string; ring?: string },
     highlight: boolean,
   ) {
-    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color, roughness: 0.8 }));
+    const ghost = tag.member !== undefined && this.ghosts.has(tag.member);
+    const mesh = new THREE.Mesh(
+      geometry,
+      ghost
+        ? new THREE.MeshStandardMaterial({
+            color: 0x3d9d86,
+            transparent: true,
+            opacity: 0.45,
+            depthWrite: false,
+          })
+        : new THREE.MeshStandardMaterial({ color, roughness: 0.8 }),
+    );
     mesh.position.copy(position);
     mesh.quaternion.copy(rotation);
-    mesh.userData = tag;
     this.group.add(mesh);
+    if (ghost) return mesh;
+    mesh.userData = tag;
     this.targets.push(mesh);
     if (highlight) {
       const outline = new THREE.LineSegments(
@@ -195,6 +356,7 @@ export class Viewport {
       );
       outline.position.copy(position);
       outline.quaternion.copy(rotation);
+      outline.userData = { ...tag };
       this.group.add(outline);
     }
     return mesh;
@@ -241,7 +403,7 @@ export class Viewport {
             femaleLayerSign(design, member, frame.z) * (member.layer + 0.5) * design.geometry.thickness,
           );
         this.mesh(
-          femaleGeometry(length, design.geometry, member.holeCount),
+          femaleGeometry(length, design.geometry, member.holeCount, member),
           0xd9bb85,
           a.clone().add(shift),
           frame.quaternion,
@@ -313,12 +475,13 @@ export class Viewport {
     for (const node of design.nodes) {
       const point = points.get(node.id);
       if (!point) continue;
+      const anchor = this.anchors.has(node.id);
       const mesh = new THREE.Mesh(
-        new THREE.SphereGeometry(selected === node.id ? 0.045 : 0.024, 12, 8),
+        new THREE.SphereGeometry(selected === node.id ? 0.045 : anchor ? 0.038 : 0.024, 12, 8),
         new THREE.MeshStandardMaterial({
-          color: selected === node.id ? 0xf1a043 : node.fixed ? 0x275d4d : 0xeee6d0,
+          color: selected === node.id ? 0xf1a043 : anchor ? 0x2fbf8f : node.fixed ? 0x275d4d : 0xeee6d0,
           transparent: true,
-          opacity: labels ? 0.9 : 0,
+          opacity: labels || anchor ? 0.9 : 0,
         }),
       );
       mesh.position.copy(point);
@@ -331,6 +494,7 @@ export class Viewport {
           new THREE.MeshStandardMaterial({ color: 0x506e5a }),
         );
         support.position.copy(point).add(new THREE.Vector3(0, -0.13, 0));
+        support.userData = { node: node.id };
         this.group.add(support);
       }
     }
@@ -371,12 +535,11 @@ export class Viewport {
           this.group.add(line);
         }
       }
-    this.selectedNode = design.nodes.some((n) => n.id === selected) ? selected : "";
-    const selectedPoint = points.get(this.selectedNode);
-    if (this.editing && this.move && selectedPoint) {
-      this.anchor.position.copy(selectedPoint);
+    if (this.editing && this.spec && !displacement && !this.transform.dragging) {
+      this.anchor.position.set(...this.spec.pivot);
+      this.anchor.quaternion.copy(this.base);
       this.transform.attach(this.anchor);
-    } else this.transform.detach();
+    } else if (!this.transform.dragging) this.transform.detach();
   }
   private frameOverlay(frame: RopeFrame, points: Map<string, THREE.Vector3>, selected: boolean) {
     const p = frame.nodes.map((id) => points.get(id));
@@ -409,6 +572,18 @@ export class Viewport {
     this.controls.target.copy(center);
     this.camera.position.copy(center).add(new THREE.Vector3(1, 0.65, 1).multiplyScalar(size));
     this.controls.update();
+  }
+  /** Reframe only when one of the given nodes has left the visible part of the view. */
+  fitIfOutside(nodeIds: string[]) {
+    if (!this.current) return;
+    this.camera.updateMatrixWorld();
+    const outside = this.current.nodes
+      .filter((n) => nodeIds.includes(n.id))
+      .some((n) => {
+        const p = new THREE.Vector3(...n.position).project(this.camera);
+        return p.z > 1 || Math.abs(p.x) > 0.9 || Math.abs(p.y) > 0.9;
+      });
+    if (outside) this.fit();
   }
   viewTop() {
     this.camera.position.copy(this.controls.target).add(new THREE.Vector3(0.001, 5, 0));
