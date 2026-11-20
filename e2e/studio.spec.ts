@@ -410,13 +410,14 @@ test("builds a structure from scratch: new board, male, female, then analysis", 
   await page.getByRole("button", { name: "③ 雌材を追加", exact: true }).click();
   await expect(page.locator("#counts")).toContainText("5節点 / 3部材 / 0ロープ / 0丸材 / 2穴接続");
   await expect(page.getByRole("alert")).toBeHidden();
+  // Supports follow the floor and the load moves to a free node, so the analysis runs without setup.
   await showTab(page, "シミュレーション");
-  await page.getByLabel("荷重点", { exact: true }).selectOption("n3");
+  await expect(page.getByLabel("荷重点", { exact: true })).not.toHaveValue("n1");
   await expect(page.locator("#status")).toContainText("計算完了");
   await expect(page.locator("#comparison tr")).toHaveCount(3);
   await page.screenshot({ path: "test-results/from-scratch.png" });
   await page.keyboard.press("Control+z");
-  await expect(page.locator("#counts")).toContainText("5節点 / 3部材");
+  await expect(page.locator("#counts")).toContainText("4節点 / 2部材");
   expect(errors).toEqual([]);
 });
 

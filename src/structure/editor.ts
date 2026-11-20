@@ -524,6 +524,39 @@ export function createDrawingDesign(catalogId = "female-2400-square"): Design {
 }
 
 /**
+ * Connects males whose tenons pass through a hole of a board they do not share a node with, e.g. a male
+ * through the crossing of two braces whose recorded connection was lost in an earlier edit. Such a male
+ * gets all its holes recorded, like a male inserted with the hole tool. Returns the males connected.
+ */
+export function connectThreadedMales(design: Design): string[] {
+  const connected: string[] = [];
+  // Legacy designs keep the joints they were saved with.
+  if (design.version !== 6) return connected;
+  for (const male of design.members.filter((m) => m.kind === "male")) {
+    if (design.connections.some((c) => c.male === male.id)) continue;
+    const start = design.nodes.find((n) => n.id === male.start);
+    const end = design.nodes.find((n) => n.id === male.end);
+    if (!start || !end) continue;
+    let holes: ReturnType<typeof matchingShaftHoles>;
+    try {
+      holes = matchingShaftHoles(design, start.position, end.position, male.id);
+    } catch (error) {
+      // A shaft running into a board at an angle is a collision; the collision check reports it with
+      // the members involved, so it is not a joint to record here.
+      if (error instanceof Error) continue;
+      throw error;
+    }
+    const through = holes.some((hole) => {
+      const board = design.members.find((m) => m.id === hole.female);
+      return board && ![board.start, board.end].some((n) => n === male.start || n === male.end);
+    });
+    if (!through) continue;
+    rematchInsertedMales(design, male.id);
+    connected.push(male.id);
+  }
+  return connected;
+}
+/**
  * Re-records the holes every inserted male passes through (males with hole connections, plus `alsoMale`).
  * Used after an edit moves boards or tenons so the recorded joints match the geometry again.
  */

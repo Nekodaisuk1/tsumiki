@@ -77,6 +77,10 @@ function overlap(a: Cell, b: Cell): boolean {
   return true;
 }
 /** Narrow phase for the same polygonal circular holes and rounded outlines used by the renderer. */
+/** Corner points of the drawing solid of a member (the same outline the renderer and collisions use). */
+export function memberSolidPoints(design: Design, member: Member): Vector3[] {
+  return cells(design, member).flatMap((cell) => cell.points);
+}
 export function drawingMembersOverlap(design: Design, a: Member, b: Member): boolean {
   const ac = cells(design, a);
   const bc = cells(design, b);
