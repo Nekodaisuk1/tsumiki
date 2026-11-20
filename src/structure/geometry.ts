@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { femaleMargin, holeOffsets, memberPart } from "./catalog";
 import type { Design, GeometryProfile, Member } from "./design";
 import { ASSEMBLY_SLOTS } from "./seats";
 
@@ -11,39 +12,81 @@ function squareHole(size: number, x = 0) {
     .lineTo(x + half, -half)
     .closePath();
 }
-export function femaleGeometry(length: number, profile: GeometryProfile, holeCount: number) {
-  const margin = profile.boardWidth * 0.7;
+export function roundedRectangle(left: number, bottom: number, right: number, top: number, radius: number) {
+  const shape = new THREE.Shape();
+  const r = Math.min(radius, (right - left) / 2, (top - bottom) / 2);
+  shape.moveTo(left + r, bottom).lineTo(right - r, bottom);
+  if (r) shape.absarc(right - r, bottom + r, r, -Math.PI / 2, 0, false);
+  shape.lineTo(right, top - r);
+  if (r) shape.absarc(right - r, top - r, r, 0, Math.PI / 2, false);
+  shape.lineTo(left + r, top);
+  if (r) shape.absarc(left + r, top - r, r, Math.PI / 2, Math.PI, false);
+  shape.lineTo(left, bottom + r);
+  if (r) shape.absarc(left + r, bottom + r, r, Math.PI, Math.PI * 1.5, false);
+  shape.closePath();
+  return shape;
+}
+export function femaleShape(length: number, profile: GeometryProfile, holeCount: number, member?: Member) {
+  const margin = femaleMargin(profile, member);
   const width = profile.boardWidth;
-  const shape = new THREE.Shape()
-    .moveTo(-margin, -width / 2)
-    .lineTo(length + margin, -width / 2)
-    .lineTo(length + margin, width / 2)
-    .lineTo(-margin, width / 2)
-    .closePath();
-  for (let i = 0; i < holeCount; i++)
-    shape.holes.push(squareHole(profile.holeSize, (length * i) / (holeCount - 1)));
-  const geometry = new THREE.ExtrudeGeometry(shape, { depth: profile.thickness, bevelEnabled: false });
-  geometry.translate(0, 0, -profile.thickness / 2);
+  const shape = roundedRectangle(
+    -margin,
+    -width / 2,
+    length + margin,
+    width / 2,
+    memberPart(member)?.end === "round" ? width / 2 : 0,
+  );
+  for (const x of holeOffsets(length, holeCount, member)) {
+    if (profile.specification === "hitoto-v1") {
+      const hole = new THREE.Path();
+      hole.absarc(x, 0, profile.holeSize / 2, 0, Math.PI * 2, true);
+      shape.holes.push(hole);
+    } else shape.holes.push(squareHole(profile.holeSize, x));
+  }
+  return shape;
+}
+export const CURVE_SEGMENTS = 24;
+function extrude(shape: THREE.Shape, depth: number) {
+  const geometry = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: false,
+    curveSegments: CURVE_SEGMENTS,
+  });
+  geometry.translate(0, 0, -depth / 2);
   return geometry;
+}
+export function femaleGeometry(length: number, profile: GeometryProfile, holeCount: number, member?: Member) {
+  return extrude(femaleShape(length, profile, holeCount, member), profile.thickness);
 }
 export function ringGeometry(profile: GeometryProfile) {
   const shape = new THREE.Shape();
-  shape.absarc(0, 0, profile.boardWidth / 2, 0, Math.PI * 2, false);
-  shape.holes.push(squareHole(profile.holeSize));
-  const geometry = new THREE.ExtrudeGeometry(shape, {
-    depth: profile.thickness,
-    bevelEnabled: false,
-    curveSegments: 32,
-  });
-  geometry.translate(0, 0, -profile.thickness / 2);
+  shape.absarc(
+    0,
+    0,
+    profile.specification === "hitoto-v1" ? 0.05 : profile.boardWidth / 2,
+    0,
+    Math.PI * 2,
+    false,
+  );
+  if (profile.specification === "hitoto-v1") {
+    const hole = new THREE.Path();
+    hole.absarc(0, 0, profile.holeSize / 2, 0, Math.PI * 2, true);
+    shape.holes.push(hole);
+  } else shape.holes.push(squareHole(profile.holeSize));
+  const geometry = extrude(shape, profile.thickness);
   geometry.rotateY(Math.PI / 2);
   return geometry;
+}
+export function tenonShape(profile: GeometryProfile) {
+  const half = profile.tenonSize / 2;
+  return roundedRectangle(-half, -half, half, half, profile.tenonCornerRadius ?? 0);
 }
 export function maleGeometry(length: number, profile: GeometryProfile) {
   const body = new THREE.BoxGeometry(length, profile.boardWidth, profile.thickness);
   body.translate(length / 2, 0, 0);
   const peg = (x: number) => {
-    const g = new THREE.BoxGeometry(profile.tenonLength, profile.tenonSize, profile.tenonSize);
+    const g = extrude(tenonShape(profile), profile.tenonLength);
+    g.rotateY(Math.PI / 2);
     g.translate(x, 0, 0);
     return g;
   };

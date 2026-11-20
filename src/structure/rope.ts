@@ -24,7 +24,10 @@ export function ropeAttachments(design: Design, rope: Rope) {
   const winding = design.members.find((m) => m.id === rope.windingMember && m.kind === "male");
   const side = ropeSideMember(design, rope);
   if (!winding || !side) throw new Error("ロープを掛ける雄材がありません");
-  const distance = (ASSEMBLY_SLOTS + 0.5) * design.geometry.thickness;
+  const distance =
+    design.version === 6
+      ? design.geometry.tenonLength - design.geometry.thickness / 2
+      : (ASSEMBLY_SLOTS + 0.5) * design.geometry.thickness;
   return rope.route.map((nodeId) => {
     const host = nodeId === winding.start || nodeId === winding.end ? winding : side;
     const node = design.nodes.find((n) => n.id === nodeId);

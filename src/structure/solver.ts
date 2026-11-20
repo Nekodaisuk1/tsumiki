@@ -129,6 +129,8 @@ export function squareTorsionGap(tenon: number, hole: number) {
 }
 function assemble(design: Design, mode: RopeMode) {
   validateDesign(design);
+  if (design.version === 6 && design.jointModel === "clearance-contact")
+    throw new Error("図面の丸穴・角丸凸部の接触則は未校正です。剛接合の参考比較を選んでください");
   const nodeCount = design.nodes.length;
   const index = new Map(design.nodes.map((n, i) => [n.id, i]));
   const centers = design.nodes.map((n) => [...n.position] as Vec3);

@@ -47,13 +47,29 @@ it("rejects overlapping tenons beyond the bodies", () => {
   const d = pair("male", "male", [1.3, 0, 0], [2.3, 0, 0]);
   expect(() => serializeDesign(d)).toThrow(/干渉/);
 });
-it("allows true hole insertion but rejects a rotated square tenon cutting the hole walls", () => {
+it("allows true hole insertion and a tenon turned inside its hole (hole size unresolved)", () => {
   const d = createDesign();
   const added = insertMaleAtHole(d, "m4", 3, 1, 1);
   expect(() => serializeDesign(d)).not.toThrow();
   const male = d.members.find((m) => m.id === added.memberId);
   if (!male) throw new Error("Missing inserted member");
+  // Boards may sit at any angle around a tenon (e.g. triangular sections); the hole is assumed large enough.
   male.roll = 45;
+  expect(() => serializeDesign(d)).not.toThrow();
+});
+it("still rejects a male body cutting through a board it is not threaded into", () => {
+  const d = createDesign();
+  const added = insertMaleAtHole(d, "m4", 3, 1, 1);
+  const male = d.members.find((m) => m.id === added.memberId);
+  if (!male) throw new Error("Missing inserted member");
+  const start = d.nodes.find((n) => n.id === male.start);
+  const end = d.nodes.find((n) => n.id === male.end);
+  if (!start || !end) throw new Error("Missing nodes");
+  // Slide the whole male along its shaft so its body, not its tenon, sits in the board.
+  const shift = end.position.map((v, i) => (v - start.position[i]) * 0.5);
+  start.position = start.position.map((v, i) => v - shift[i]) as typeof start.position;
+  end.position = end.position.map((v, i) => v - shift[i]) as typeof end.position;
+  d.connections = [];
   expect(() => serializeDesign(d)).toThrow(/干渉/);
 });
 it("rejects female boards crossing on the same occupied layer", () => {

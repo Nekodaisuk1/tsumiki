@@ -1,3 +1,4 @@
+import { femaleMargin, holeOffsets, tenonOuterRadius } from "./catalog";
 import type { Design, Member, Vec3 } from "./design";
 export const add3 = (a: Vec3, b: Vec3) => a.map((v, i) => v + b[i]) as Vec3;
 export const sub3 = (a: Vec3, b: Vec3) => a.map((v, i) => v - b[i]) as Vec3;
@@ -39,7 +40,7 @@ export function holeSite(design: Design, femaleId: string, hole: number) {
   if (!member || !Number.isInteger(hole) || hole < 0 || hole >= member.holeCount)
     throw new Error("雌材の有効な穴を選んでください");
   const axes = boardAxes(design, member);
-  const center = add3(axes.start, scale3(sub3(axes.end, axes.start), hole / (member.holeCount - 1)));
+  const center = add3(axes.start, scale3(axes.x, holeOffsets(axes.length, member.holeCount, member)[hole]));
   return {
     female: member.id,
     hole,
@@ -84,23 +85,33 @@ export function matchingShaftHoles(design: Design, start: Vec3, end: Vec3, ignor
     const along = dot3(local, axes.x);
     const across = Math.hypot(...sub3(local, scale3(axes.x, along)));
     if (
-      along < -design.geometry.boardWidth * 0.7 ||
-      along > axes.length + design.geometry.boardWidth * 0.7 ||
+      along < -femaleMargin(design.geometry, member) ||
+      along > axes.length + femaleMargin(design.geometry, member) ||
       across > design.geometry.boardWidth / 2
     )
       continue;
     if (Math.abs(denominator) < 1 - 1e-6) throw new Error("雄材は雌材の面に垂直に差し込んでください");
-    const hole = Math.round((along / axes.length) * (member.holeCount - 1));
+    const offsets = holeOffsets(axes.length, member.holeCount, member);
+    const hole = offsets.reduce(
+      (best, value, i) => (Math.abs(value - along) < Math.abs(offsets[best] - along) ? i : best),
+      0,
+    );
     if (hole < 0 || hole >= member.holeCount) throw new Error("シャフトが雌材の穴のない部分に当たります");
     const site = holeSite(design, member.id, hole);
-    const clearance = (design.geometry.holeSize - design.geometry.tenonSize) / 2;
+    const clearance =
+      design.version === 6
+        ? design.geometry.holeSize / 2 - tenonOuterRadius(design.geometry)
+        : (design.geometry.holeSize - design.geometry.tenonSize) / 2;
+    if (clearance < 0)
+      throw new Error("凸部の角丸Rが小さく、丸穴に入りません。図面の凸部断面を確認してください");
     if (Math.hypot(...sub3(point, site.position)) > Math.max(1e-7, clearance))
       throw new Error("シャフトが雌材の穴のない部分に当たります");
     if (holeOccupied(design, member.id, hole, ignoreMale))
       throw new Error("この穴は既に別の雄材に接続されています");
     const endSide = distance < 0 ? "start" : "end";
     const offset = distance < 0 ? -distance : distance - length;
-    const seat = Math.round(offset / t - 0.5);
+    // `+ 0` turns a rounded -0 into 0 so recorded seats compare equal after a save round trip.
+    const seat = Math.round(offset / t - 0.5) + 0;
     if (seat < 0 || seat >= 4 || Math.abs(offset / t - (seat + 0.5)) > 1e-5)
       throw new Error("差し込み位置が板厚の4枚分を超えるか、先端のロープ用領域にかかります");
     result.push({ female: member.id, hole, end: endSide, seat });
@@ -108,7 +119,8 @@ export function matchingShaftHoles(design: Design, start: Vec3, end: Vec3, ignor
   return result;
 }
 export function insertionPreview(design: Design, female: string, hole: number, length: number, side: 1 | -1) {
-  if (!Number.isFinite(length) || length < 0.2 || length > 4) throw new Error("雄材の長さ比は0.2〜4です");
+  if (!Number.isFinite(length) || length < (design.version === 6 ? 0.001 : 0.2) || length > 4)
+    throw new Error("雄材の長さ比は0.2〜4です");
   if (holeOccupied(design, female, hole))
     throw new Error("この穴は既に雄材に接続されています。空いている穴を選んでください");
   const site = holeSite(design, female, hole);

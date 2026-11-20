@@ -1,3 +1,4 @@
+import { catalogPart, HITOTO_GEOMETRY, tenonOuterRadius } from "./catalog";
 import { validateMemberCollisions } from "./collision.ts";
 import { holeSite, matchingShaftHoles } from "./holes.ts";
 import { ASSEMBLY_SLOTS, TENON_THICKNESS_UNITS } from "./seats.ts";
@@ -12,8 +13,11 @@ export type Member = {
   roll: number;
   layer: number;
   holeCount: number;
+  catalogId?: string;
 };
 export type GeometryProfile = {
+  specification?: "hitoto-v1";
+  tenonCornerRadius?: number;
   boardWidth: number;
   thickness: number;
   tenonSize: number;
@@ -71,7 +75,7 @@ export type RopeWrap = "sliding" | "locked";
 export const DEFAULT_JOINT: JointParameters = { contactStiffness: 2000, openStiffness: 0.5 };
 export type Design = {
   format: "tsumiki-design";
-  version: 5;
+  version: 5 | 6;
   solver: "frame3d-contact-v5";
   units: "dimensionless";
   name: string;
@@ -239,7 +243,7 @@ export function validateDesign(value: unknown): asserts value is Design {
   );
   if (
     d.format !== "tsumiki-design" ||
-    d.version !== 5 ||
+    (d.version !== 5 && d.version !== 6) ||
     d.solver !== "frame3d-contact-v5" ||
     d.units !== "dimensionless" ||
     !["rigid-approximation", "clearance-contact"].includes(String(d.jointModel))
@@ -271,7 +275,24 @@ export function validateDesign(value: unknown): asserts value is Design {
   )
     throw new Error("節点は2〜32、部材・材料は1件以上必要です");
   const geometry = object(d.geometry, "geometry");
-  keys(geometry, ["boardWidth", "thickness", "tenonSize", "tenonLength", "holeSize"], "geometry");
+  keys(
+    geometry,
+    [
+      "boardWidth",
+      "thickness",
+      "tenonSize",
+      "tenonLength",
+      "holeSize",
+      ...(design.version === 6 ? ["specification", "tenonCornerRadius"] : []),
+    ],
+    "geometry",
+  );
+  if (design.version === 6) {
+    if (geometry.specification !== "hitoto-v1") throw new Error("図面規格が不正です");
+    for (const key of ["boardWidth", "thickness", "tenonSize", "tenonLength", "holeSize"] as const)
+      if (geometry[key] !== HITOTO_GEOMETRY[key]) throw new Error(`図面寸法 ${key} が一致しません`);
+    number(geometry.tenonCornerRadius, 0, design.geometry.tenonSize / 2, "tenonCornerRadius");
+  }
   for (const key of ["boardWidth", "thickness", "tenonSize", "tenonLength", "holeSize"])
     number(geometry[key], 0.005, 0.5, `geometry.${key}`);
   if (
@@ -279,7 +300,10 @@ export function validateDesign(value: unknown): asserts value is Design {
     design.geometry.holeSize >= (design.geometry.boardWidth / Math.sqrt(2)) * 0.98
   )
     throw new Error("穴は角棒より大きく、板幅より小さくしてください");
-  if (Math.abs(design.geometry.tenonLength - design.geometry.thickness * TENON_THICKNESS_UNITS) > 1e-10)
+  if (
+    design.version === 5 &&
+    Math.abs(design.geometry.tenonLength - design.geometry.thickness * TENON_THICKNESS_UNITS) > 1e-10
+  )
     throw new Error("雄材の凸部の長さは雌材の板厚5枚分です");
   const seen = new Set<string>();
   for (const list of [
@@ -315,7 +339,17 @@ export function validateDesign(value: unknown): asserts value is Design {
   for (const m of design.members) {
     keys(
       object(m, "member"),
-      ["id", "kind", "start", "end", "material", "roll", "layer", "holeCount"],
+      [
+        "id",
+        "kind",
+        "start",
+        "end",
+        "material",
+        "roll",
+        "layer",
+        "holeCount",
+        ...(design.version === 6 ? ["catalogId"] : []),
+      ],
       "member",
     );
     if (
@@ -343,6 +377,16 @@ export function validateDesign(value: unknown): asserts value is Design {
         design.geometry.holeSize * 1.05
     )
       throw new Error("雌材の穴が重なります。穴数を減らすか部材を長くしてください");
+    if (design.version === 6) {
+      if (typeof m.catalogId !== "string") throw new Error("図面の部材規格を選んでください");
+      const part = catalogPart(m.catalogId);
+      if (
+        m.kind !== part.kind ||
+        Math.abs(Math.hypot(...a.position.map((v, i) => v - b.position[i])) - part.span) > 1e-6 ||
+        m.holeCount !== (part.kind === "female" ? part.holes.length : 2)
+      )
+        throw new Error(`図面規格 ${part.label} の長さ・穴数・種類を維持してください`);
+    }
     const edge = [m.start, m.end].sort().join(":");
     const seat = m.kind === "female" ? `${edge}:female:${m.layer}` : `${edge}:male`;
     if (
@@ -427,6 +471,12 @@ export function validateDesign(value: unknown): asserts value is Design {
     )
       throw new Error("雄材のシャフトと雌材の穴の接続が一致しません。穴に垂直にスナップしてください");
   }
+  if (
+    design.version === 6 &&
+    design.rings.length &&
+    tenonOuterRadius(design.geometry) > design.geometry.holeSize / 2
+  )
+    throw new Error("凸部の角丸Rが小さく、丸材の丸穴に入りません");
   const seats = new Set<string>();
   for (const r of design.rings) {
     keys(object(r, "ring"), ["id", "member", "end", "slot", "role"], "ring");
