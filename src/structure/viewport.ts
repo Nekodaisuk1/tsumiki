@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { Design, Vec3 } from "./design";
+import type { EngineeringResult } from "./engineering";
 import { femaleGeometry, femaleLayerSign, maleGeometry, memberFrame, ringGeometry } from "./geometry";
 import { holeOccupied, holeSite } from "./holes";
 import { detectRopeFrames, type RopeFrame, ropeAttachments } from "./rope";
@@ -29,6 +30,10 @@ export type GizmoMotion = { translate: Vec3; axis: Vec3; angle: number; pivot: V
 const MAGNET = 0.06;
 
 export class Viewport {
+  private engineering: EngineeringResult | null = null;
+  setEngineering(result: EngineeringResult | null) {
+    this.engineering = result;
+  }
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
   private camera = new THREE.PerspectiveCamera(38, 1, 0.01, 100);
@@ -66,6 +71,11 @@ export class Viewport {
   /** Members picked as the base of the active tool; they glow softly until released. */
   setMarked(members: string[]) {
     this.marked = new Set(members);
+  }
+  private resizeHint: { moving: string; fixed: string } | null = null;
+  /** The ends of the selected board for catalog resizing: an arrow on the end that moves, a lock on the other. */
+  setResizeHint(hint: { moving: string; fixed: string } | null) {
+    this.resizeHint = hint;
   }
   /** Nodes offered as starting points for the active tool. */
   setAnchorChoices(nodes: string[]) {
@@ -108,6 +118,11 @@ export class Viewport {
     this.choosingHole = choosing;
     this.chosenHole = chosen;
     this.preview = preview;
+  }
+  private holeMarks: { female: string; hole: number }[] = [];
+  /** Holes picked for laying over each other: the first one (blue) stays, the others (orange) turn onto it. */
+  setHoleMarks(holes: { female: string; hole: number }[]) {
+    this.holeMarks = holes;
   }
   setFrameSelection(choosing: boolean, id: string) {
     this.choosingFrame = choosing;
@@ -361,10 +376,22 @@ export class Viewport {
     }
     return mesh;
   }
-  private line(a: THREE.Vector3, b: THREE.Vector3, color: number, width: number) {
+  private line(a: THREE.Vector3, b: THREE.Vector3, color: number, width: number, overlay = false) {
     const delta = b.clone().sub(a);
     const geometry = new THREE.CylinderGeometry(width, width, delta.length(), 6);
-    const mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ color }));
+    const mesh = new THREE.Mesh(
+      geometry,
+      overlay
+        ? new THREE.MeshBasicMaterial({
+            color,
+            transparent: true,
+            opacity: 0.35,
+            depthTest: false,
+            depthWrite: false,
+          })
+        : new THREE.MeshStandardMaterial({ color }),
+    );
+    if (overlay) mesh.renderOrder = 8;
     mesh.position.copy(a).add(b).multiplyScalar(0.5);
     mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), delta.normalize());
     this.group.add(mesh);
@@ -412,6 +439,25 @@ export class Viewport {
         );
       }
     }
+    if (this.engineering) {
+      const maximum = Math.max(1e-12, ...this.engineering.members.map((m) => m.normalMPa));
+      for (const target of this.targets) {
+        const member = this.engineering.members.find((m) => m.id === target.userData.member);
+        if (member && target instanceof THREE.Mesh && target.material instanceof THREE.MeshStandardMaterial)
+          target.material.color.setHSL((1 - member.normalMPa / maximum) * 0.65, 0.85, 0.55);
+      }
+      for (const element of this.engineering.elements) {
+        const points = element.samples.map((s) =>
+          new THREE.Vector3(...s.position).addScaledVector(new THREE.Vector3(...s.displacement), scale),
+        );
+        const curve = new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(points),
+          new THREE.LineBasicMaterial({ color: 0xffffff, depthTest: false }),
+        );
+        curve.renderOrder = 10;
+        this.group.add(curve);
+      }
+    }
     if (ropeMode !== "none")
       for (const rope of design.ropes) {
         const attachments = ropeAttachments(design, rope);
@@ -427,21 +473,26 @@ export class Viewport {
           }
           return point;
         });
-        for (let s = 0; s < 3; s++)
-          this.line(ropePoints[s], ropePoints[s + 1], ropeMode === "slack" ? 0xb1a18c : 0xc95732, 0.006);
+        const color = ropeMode === "slack" ? 0xd8c4a4 : 0xff5a36;
+        for (let s = 0; s < 3; s++) {
+          this.line(ropePoints[s], ropePoints[s + 1], color, 0.009);
+          // A faint copy drawn over everything, so the parts behind boards and tenons stay visible.
+          this.line(ropePoints[s], ropePoints[s + 1], color, 0.009, true);
+        }
       }
     for (const frame of detectRopeFrames(design))
       if (this.choosingFrame || frame.id === this.selectedFrame)
         this.frameOverlay(frame, points, frame.id === this.selectedFrame);
     for (const member of design.members.filter((m) => m.kind === "female"))
       for (let hole = 0; hole < member.holeCount; hole++) {
-        const chosen = this.chosenHole?.female === member.id && this.chosenHole.hole === hole;
+        const mark = this.holeMarks.findIndex((h) => h.female === member.id && h.hole === hole);
+        const chosen = mark >= 0 || (this.chosenHole?.female === member.id && this.chosenHole.hole === hole);
         if ((!this.choosingHole && !chosen) || holeOccupied(design, member.id, hole)) continue;
         const site = holeSite(design, member.id, hole);
         const marker = new THREE.Mesh(
           new THREE.SphereGeometry(chosen ? 0.032 : 0.022, 10, 8),
           new THREE.MeshBasicMaterial({
-            color: chosen ? 0xf4aa34 : 0x269d77,
+            color: mark === 0 ? 0x5aa6e6 : chosen ? 0xf4aa34 : 0x269d77,
             transparent: true,
             opacity: 0.75,
             depthTest: false,
@@ -497,6 +548,42 @@ export class Viewport {
         support.userData = { node: node.id };
         this.group.add(support);
       }
+    }
+    const hint = this.resizeHint;
+    const moving = hint ? points.get(hint.moving) : undefined;
+    const fixedEnd = hint ? points.get(hint.fixed) : undefined;
+    if (moving && fixedEnd) {
+      // Double arrow along the board at the end that moves: outward lengthens, inward shortens.
+      const along = moving.clone().sub(fixedEnd).normalize();
+      for (const sign of [1, -1]) {
+        const arrow = new THREE.ArrowHelper(
+          along.clone().multiplyScalar(sign),
+          moving.clone().addScaledVector(along, sign * 0.04),
+          0.2,
+          0xf1a043,
+          0.07,
+          0.05,
+        );
+        // Drawn on top: the inward arrow and the lock sit inside the board and the tenon.
+        for (const part of [arrow.line, arrow.cone]) {
+          for (const material of Array.isArray(part.material) ? part.material : [part.material])
+            material.depthTest = false;
+          part.renderOrder = 10;
+        }
+        this.group.add(arrow);
+      }
+      const lock = new THREE.Mesh(
+        new THREE.BoxGeometry(0.06, 0.06, 0.06),
+        new THREE.MeshStandardMaterial({
+          color: 0x5aa6e6,
+          transparent: true,
+          opacity: 0.85,
+          depthTest: false,
+        }),
+      );
+      lock.renderOrder = 10;
+      lock.position.copy(fixedEnd);
+      this.group.add(lock);
     }
     for (const ring of design.rings) {
       const host = design.members.find((m) => m.id === ring.member);

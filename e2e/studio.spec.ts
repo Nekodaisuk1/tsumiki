@@ -8,7 +8,9 @@ import {
   createDrawingDesign,
   createSeedDesign,
   insertMaleAtHole,
+  rematchInsertedMales,
 } from "../src/structure/editor";
+import { holeSite } from "../src/structure/holes";
 import { addTemplate } from "../src/structure/templates";
 
 async function showTab(page: import("@playwright/test").Page, name: "モデリング" | "シミュレーション") {
@@ -859,5 +861,144 @@ test("steps the board size of square and triangle templates by drawing sizes", a
   await page.getByRole("button", { name: "③ テンプレートを追加", exact: true }).click();
   await expect(page.getByRole("alert")).toBeHidden();
   await expect(page.locator("#counts")).toContainText("10部材");
+  expect(errors).toEqual([]);
+});
+
+test("mirror mode repeats edits from one tenon of the centre male on the other", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.locator("#drawing-start").selectOption("male-1200");
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  await expect(page.locator("#counts")).toContainText("2節点 / 1部材");
+  await page.keyboard.press("m");
+  await expect(page.locator("#mirror-mode")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#mirror-mode")).toContainText("ミラー ON（m0）");
+  // A board going up from the start tenon gets its image going up from the end tenon.
+  await page.getByRole("button", { name: "▣ 雌材", exact: true }).click();
+  await expect(page.locator("#female-anchor")).toContainText("n0");
+  await page.getByRole("button", { name: "+Y 上へ" }).click();
+  await page.getByRole("button", { name: "③ 雌材を追加", exact: true }).click();
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#counts")).toContainText("4節点 / 3部材");
+  await page.keyboard.press("Escape");
+  await props(page, "部材");
+  await page.locator("#member").selectOption("m1");
+  await page.locator("#member-dimensions").click();
+  await page.keyboard.press("]");
+  await expect(page.locator("#status")).toContainText("1500♀角");
+  await expect(page.locator("#counts")).toContainText("4節点 / 3部材");
+  await page.screenshot({ path: "test-results/mirror-mode.png" });
+  await props(page, "配置");
+  await page.getByRole("button", { name: "全体を左右対称に" }).click();
+  await expect(page.getByRole("alert")).toContainText("左右対称です");
+  await page.locator("#outliner").getByText("m1", { exact: false }).first().click();
+  await props(page, "部材");
+  await page.locator("#member").selectOption("m1");
+  await page.locator("#member-dimensions").click();
+  await page.keyboard.press("x");
+  await expect(page.locator("#counts")).toContainText("2節点 / 1部材");
+  await page.keyboard.press("m");
+  await expect(page.locator("#mirror-mode")).toHaveAttribute("aria-pressed", "false");
+  expect(errors).toEqual([]);
+});
+
+test("turns a board on its tenon so a picked hole lies over another", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/");
+  // Two males four pitches apart with a board going up from each tip; hole 6 of the first board and
+  // hole 4 of the second are both five pitches from the first male (3 : 4 : 5).
+  const d = createDrawingDesign();
+  const span = (id: string) => catalogPart(id).span;
+  const first = insertMaleAtHole(d, "m0", 2, span("male-600"), 1);
+  const second = insertMaleAtHole(d, "m0", 4, span("male-600"), 1);
+  const a = appendMember(
+    d,
+    first.nodeId,
+    "female",
+    [0, 1, 0],
+    span("female-1200-square"),
+    "female-1200-square",
+  );
+  const b = appendMember(
+    d,
+    second.nodeId,
+    "female",
+    [0, 1, 0],
+    span("female-1200-square"),
+    "female-1200-square",
+  );
+  const turned = d.members.find((m) => m.id === a.memberId);
+  if (turned) turned.layer = 1;
+  rematchInsertedMales(d);
+  await page.locator("#file").setInputFiles({
+    name: "align.tsumiki.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(d)),
+  });
+  await expect(page.locator("#counts")).toContainText(`${d.members.length}部材`);
+  await page.keyboard.press("Home");
+  await page.getByRole("button", { name: "正面", exact: true }).click();
+  const canvas = page.locator("#viewport canvas");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("Missing canvas");
+  const bounds = new THREE.Box3();
+  for (const n of d.nodes) bounds.expandByPoint(new THREE.Vector3(...n.position));
+  bounds.expandByScalar(d.geometry.tenonLength);
+  const center = bounds.getCenter(new THREE.Vector3());
+  const camera = new THREE.PerspectiveCamera(38, box.width / box.height, 0.01, 100);
+  camera.position.copy(center).add(new THREE.Vector3(0, 0.1, 5));
+  camera.lookAt(center);
+  camera.updateMatrixWorld();
+  // The damped orbit controls may still be settling after the view change: click until the pick shows.
+  const click = async (female: string, hole: number, shows: string) => {
+    const p = new THREE.Vector3(...holeSite(d, female, hole).position).project(camera);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await page.mouse.click(box.x + ((p.x + 1) * box.width) / 2, box.y + ((1 - p.y) * box.height) / 2);
+      if ((await page.locator("#align-list").textContent())?.includes(shows)) return;
+      await page.waitForTimeout(200);
+    }
+    throw new Error(`Could not pick ${female} hole ${hole}`);
+  };
+  await page.keyboard.press("o");
+  await expect(page.locator("#shortcuts")).toContainText("Enter穴を重ねる");
+  await click(b.memberId, 3, `基準：${b.memberId} の穴4`);
+  await click(a.memberId, 5, `${a.memberId} を`);
+  await expect(page.locator("#align-list")).toContainText(`${a.memberId} を -53.1° 回す`);
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#status")).toContainText(`雌材 ${a.memberId} を回して穴を重ねました`);
+  // The coinciding holes are ready for a male through both boards.
+  const before = d.members.length;
+  await page.keyboard.press("i");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#counts")).toContainText(`${before + 1}部材`);
+  await page.screenshot({ path: "test-results/align-holes.png" });
+  expect(errors).toEqual([]);
+});
+
+test("the member panel says what moving a board one seat would swap, or why it cannot", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  await page.getByRole("button", { name: "③ 雄材を差し込む", exact: true }).click();
+  await page.getByRole("button", { name: "▣ 雌材", exact: true }).click();
+  await page.getByRole("button", { name: "+X 右へ" }).click();
+  await page.getByRole("button", { name: "③ 雌材を追加", exact: true }).click();
+  await expect(page.locator("#counts")).toContainText("3部材");
+  await page.keyboard.press("Escape");
+  await props(page, "部材");
+  await page.locator("#member").selectOption("m2");
+  const status = page.locator("#layer-status");
+  await expect(status).toContainText("▲ 外側：0段目 ⇄ 1段目");
+  await expect(status).toContainText("▼ 内側：これより内側の段はありません");
+  await expect(page.getByRole("button", { name: "▼ 内側の段へ" })).toBeDisabled();
+  await page.getByRole("button", { name: "▲ 外側の段へ" }).click();
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(status).toContainText("▼ 内側：1段目 ⇄ 0段目");
   expect(errors).toEqual([]);
 });

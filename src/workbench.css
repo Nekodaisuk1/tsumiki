@@ -390,7 +390,7 @@ input[type="checkbox"] {
   color: #e7c98f;
 }
 .legend .rope {
-  color: #ff8a65;
+  color: #ff5a36;
 }
 .error {
   position: absolute;
@@ -782,4 +782,8 @@ td {
 }
 .brace-target {
   text-align: left;
+}
+
+#layer-status {
+  white-space: pre-line;
 }
