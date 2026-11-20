@@ -1002,3 +1002,28 @@ test("the member panel says what moving a board one seat would swap, or why it c
   await expect(status).toContainText("▼ 内側：1段目 ⇄ 0段目");
   expect(errors).toEqual([]);
 });
+
+test("a 2400 board switches hole pitch and the panel names pitch changes of the next sizes", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  // A new design opens the hole picker; leave it to work on the board itself.
+  await page.keyboard.press("Escape");
+  await props(page, "部材");
+  await page.locator("#member").selectOption("m0");
+  const pitch = page.locator("#board-pitch");
+  await expect(pitch).toBeVisible();
+  await expect(pitch).toHaveText("穴の間隔を 140.25mm（140.25ピッチ版）に");
+  await pitch.click();
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#status")).toContainText("140.25ピッチ");
+  await expect(page.locator("#board-resize-ends")).toContainText("140.25ピッチ版から通常版に");
+  await expect(page.locator("#shortcuts")).toContainText("P穴の間隔");
+  await page.locator("#member-dimensions").click();
+  await page.keyboard.press("p");
+  await expect(pitch).toHaveText("穴の間隔を 140.25mm（140.25ピッチ版）に");
+  expect(errors).toEqual([]);
+});

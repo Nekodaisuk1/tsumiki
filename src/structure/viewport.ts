@@ -87,6 +87,12 @@ export class Viewport {
   setHover(member: string) {
     this.hovered = member;
   }
+  private selectedMember = "";
+  private winder = "";
+  /** The male chosen to wind the rope being set up; it glows in the rope colour. */
+  setWinder(member: string) {
+    this.winder = member;
+  }
   /** Short flash on members that just snapped into place or got a rope. */
   pulse(members: string[]) {
     this.pulseIds = new Set(members);
@@ -101,9 +107,21 @@ export class Viewport {
       if (!member || !(target instanceof THREE.Mesh)) continue;
       const material = target.material;
       if (!(material instanceof THREE.MeshStandardMaterial)) continue;
+      // The rope winder and the selection keep a steady glow of their own colour; the rest light up
+      // softly on hover, as a tool's base or in a short flash.
+      if (member === this.winder) {
+        material.emissive.setHex(0xff5a36);
+        material.emissiveIntensity = 0.7;
+        continue;
+      }
+      if (member === this.selectedMember) {
+        material.emissive.setHex(0xff9a2e);
+        material.emissiveIntensity = Math.max(0.55, this.pulseIds.has(member) ? flash : 0);
+        continue;
+      }
       const intensity = Math.max(
         this.pulseIds.has(member) ? flash : 0,
-        member === this.hovered ? 0.35 : 0,
+        member === this.hovered ? 0.25 : 0,
         this.marked.has(member) ? 0.5 : 0,
       );
       material.emissive.setHex(0xffb347);
@@ -344,7 +362,7 @@ export class Viewport {
     position: THREE.Vector3,
     rotation: THREE.Quaternion,
     tag: { member?: string; ring?: string },
-    highlight: boolean,
+    highlight: boolean | number,
   ) {
     const ghost = tag.member !== undefined && this.ghosts.has(tag.member);
     const mesh = new THREE.Mesh(
@@ -364,11 +382,18 @@ export class Viewport {
     if (ghost) return mesh;
     mesh.userData = tag;
     this.targets.push(mesh);
-    if (highlight) {
+    if (highlight !== false) {
+      // Drawn over everything, so the outline shows even where other parts hide the member.
       const outline = new THREE.LineSegments(
         new THREE.EdgesGeometry(geometry),
-        new THREE.LineBasicMaterial({ color: 0xf3912d }),
+        new THREE.LineBasicMaterial({
+          color: highlight === true ? 0x2f8cff : highlight,
+          transparent: true,
+          opacity: 0.9,
+          depthTest: false,
+        }),
       );
+      outline.renderOrder = 9;
       outline.position.copy(position);
       outline.quaternion.copy(rotation);
       outline.userData = { ...tag };
@@ -405,6 +430,7 @@ export class Viewport {
     labels = true,
   ) {
     this.current = design;
+    this.selectedMember = selected.startsWith("member:") ? selected.slice("member:".length) : "";
     this.clear();
     const points = new Map<string, THREE.Vector3>();
     design.nodes.forEach((node, i) => {
@@ -419,7 +445,8 @@ export class Viewport {
       if (!a || !b) continue;
       const frame = memberFrame(a, b, member.roll);
       const length = a.distanceTo(b);
-      const highlight = selected === `member:${member.id}`;
+      const highlight =
+        selected === `member:${member.id}` ? true : member.id === this.winder ? 0xff5a36 : false;
       if (member.kind === "male")
         for (const [i, g] of maleGeometry(length, design.geometry).entries())
           this.mesh(g, i === 0 ? 0xa47546 : 0x85623f, a, frame.quaternion, { member: member.id }, highlight);
