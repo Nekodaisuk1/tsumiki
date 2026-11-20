@@ -156,7 +156,7 @@ export function supportProblem(design: Design): string | null {
     return `部材 ${loose.join("・")} が支持された部分とつながっていません。雄材の穴・角棒でつなぐか、削除するか、その部分の節点を固定してください（ロープだけでは支えられません）`;
   return null;
 }
-function assemble(design: Design, mode: RopeMode) {
+function assemble(design: Design, mode: RopeMode, materialOverride?: Material) {
   validateDesign(design);
   const problem = supportProblem(design);
   if (problem) throw new Error(problem);
@@ -258,7 +258,7 @@ function assemble(design: Design, mode: RopeMode) {
     for (let a = 0; a < 3; a++) force[node * 6 + 3 + a] += moment[a];
   };
   const members = design.members.flatMap((member, memberIndex) => {
-    const material = design.materials.find((m) => m.id === member.material);
+    const material = materialOverride ?? design.materials.find((m) => m.id === member.material);
     if (!material) throw new Error("材料参照が不正です");
     const joints = memberJoints[memberIndex];
     return joints.slice(0, -1).map((a, part) => {
@@ -300,6 +300,9 @@ function assemble(design: Design, mode: RopeMode) {
           mass[n * 6 + i] += i < 3 ? halfMass : (halfMass * element.length ** 2) / 12;
       return {
         ...element,
+        rotation: element.transform,
+        origin: a.position,
+        memberId: member.id,
         global,
         transform,
         id: joints.length > 2 ? `${member.id}[${part + 1}]` : member.id,
@@ -664,5 +667,84 @@ export function simulate(design: Design, mode: RopeMode, excitation: Excitation)
     contactSwitch,
     initial: system.recover(initial.u),
     referenceOmega,
+  };
+}
+
+/** SI static frame analysis; kept separate from the dimensionless comparison and dynamics. */
+export function solvePhysicalFrame(design: Design, material: Material, forceN: number, selfWeight: boolean) {
+  const system = assemble(design, "none", material);
+  const force = Array(system.size).fill(0);
+  system.loadAt(force, system.loadNode, system.axis, forceN);
+  const loads = system.members.map((m) => {
+    const q = [0, 1, 2].map((i) =>
+      selfWeight ? -material.density * material.A * 9.80665 * m.rotation[i][1] : 0,
+    );
+    const l = m.length;
+    const f = [
+      (q[0] * l) / 2,
+      (q[1] * l) / 2,
+      (q[2] * l) / 2,
+      0,
+      (-q[2] * l * l) / 12,
+      (q[1] * l * l) / 12,
+      (q[0] * l) / 2,
+      (q[1] * l) / 2,
+      (q[2] * l) / 2,
+      0,
+      (q[2] * l * l) / 12,
+      (-q[1] * l * l) / 12,
+    ];
+    for (let i = 0; i < 12; i++) for (let j = 0; j < 12; j++) force[m.ids[i]] += m.transform[j][i] * f[j];
+    return { q, f };
+  });
+  const result = equilibrium(system, force);
+  const elements = system.members.map((m, index) => {
+    const u = multiply(
+      m.transform,
+      m.ids.map((i) => result.u[i]),
+    );
+    const { q, f } = loads[index];
+    const local = sub(multiply(m.local, u), f);
+    const samples = Array.from({ length: 41 }, (_, i) => {
+      const t = i / 40,
+        l = m.length,
+        x = t * l;
+      const h1 = 1 - 3 * t * t + 2 * t * t * t,
+        h2 = l * (t - 2 * t * t + t * t * t),
+        h3 = 3 * t * t - 2 * t * t * t,
+        h4 = l * (-t * t + t * t * t);
+      const d = [
+        (1 - t) * u[0] + t * u[6] + (q[0] * l * l * t * (1 - t)) / (2 * material.E * material.A),
+        h1 * u[1] +
+          h2 * u[5] +
+          h3 * u[7] +
+          h4 * u[11] +
+          (q[1] * l ** 4 * t * t * (1 - t) ** 2) / (24 * material.E * material.Iz),
+        h1 * u[2] -
+          h2 * u[4] +
+          h3 * u[8] -
+          h4 * u[10] +
+          (q[2] * l ** 4 * t * t * (1 - t) ** 2) / (24 * material.E * material.Iy),
+      ];
+      const displacement = [0, 1, 2].map((a) =>
+        d.reduce((sum, v, b) => sum + m.rotation[b][a] * v, 0),
+      ) as Vec3;
+      const position = m.origin.map((v, a) => v + m.rotation[0][a] * x) as Vec3;
+      return {
+        position,
+        displacement,
+        axial: -local[0] - q[0] * x,
+        my: -local[4] - local[2] * x - (q[2] * x * x) / 2,
+        mz: -local[5] + local[1] * x + (q[1] * x * x) / 2,
+        shearY: -local[1] - q[1] * x,
+        shearZ: -local[2] - q[2] * x,
+      };
+    });
+    return { id: m.memberId, length: m.length, local, samples };
+  });
+  return {
+    displacement: system.recover(result.u),
+    reactions: result.reactions.slice(0, system.nodeCount * 6),
+    elements,
   };
 }

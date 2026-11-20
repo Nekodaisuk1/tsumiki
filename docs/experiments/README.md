@@ -20,6 +20,7 @@ Status: Draft / Ready / In progress / Verified / Rejected / Integrated
 - [005: Structural analysis](005-structural-analysis.md)
 - [006: Rectangle shaping](006-rectangle-shaping.md)
 - [007: Three-dimensional reinforcement](007-3d-reinforcement.md)
+- [010: SI timber static reference analysis](010-timber-static.md)
 
 001 → 002 → 003を基礎とし、004・005を検証する。006は対象形状の定義後に、接合・ロープの制約と統合する。実装順は実験で見つかった依存関係に応じて更新する。
 
