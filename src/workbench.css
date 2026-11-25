@@ -149,11 +149,13 @@ input[type="checkbox"] {
 }
 .button-row {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-top: 6px;
 }
 .button-row button {
   flex: 1;
+  min-width: min(72px, 100%);
   padding: 3px 4px;
 }
 .nudge {
@@ -212,7 +214,7 @@ input[type="checkbox"] {
 /* Workspace grid */
 .workspace {
   display: grid;
-  grid-template-columns: 44px minmax(0, 1fr) 340px;
+  grid-template-columns: 44px minmax(0, 1fr) var(--side-width, 340px);
   grid-template-rows: minmax(0, 1fr);
   grid-template-areas: "tools view side";
   gap: 1px;
@@ -220,7 +222,7 @@ input[type="checkbox"] {
   min-height: 0;
 }
 .workspace[data-mode="sim"] {
-  grid-template-rows: minmax(0, 1fr) minmax(220px, 36vh);
+  grid-template-rows: minmax(0, 1fr) var(--time-height, minmax(220px, 36vh));
   grid-template-areas:
     "tools view side"
     "tools time side";
@@ -263,8 +265,10 @@ input[type="checkbox"] {
   grid-area: view;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   background: var(--panel);
+  container: viewer / inline-size;
 }
 .view-header {
   display: flex;
@@ -392,6 +396,15 @@ input[type="checkbox"] {
 .legend .rope {
   color: #ff5a36;
 }
+/* Bottom right above the axis legend, clear of the shortcut list on the left. */
+.layer-legend {
+  left: auto;
+  right: 10px;
+  bottom: 26px;
+}
+.layer-legend[hidden] {
+  display: none;
+}
 .error {
   position: absolute;
   top: 10px;
@@ -411,11 +424,14 @@ input[type="checkbox"] {
 /* Right sidebar: outliner + properties */
 .sidebar {
   grid-area: side;
+  position: relative;
   display: grid;
-  grid-template-rows: minmax(120px, 32%) minmax(0, 1fr);
+  grid-template-rows: var(--outliner-height, minmax(120px, 32%)) minmax(0, 1fr);
   gap: 1px;
+  min-width: 0;
   min-height: 0;
   background: #111;
+  container: sidebar / inline-size;
 }
 .outliner,
 .properties {
@@ -423,6 +439,7 @@ input[type="checkbox"] {
   min-height: 0;
 }
 .outliner {
+  position: relative;
   display: flex;
   flex-direction: column;
   padding: 6px 0 0;
@@ -453,6 +470,8 @@ input[type="checkbox"] {
   text-align: left;
   font-size: 11px;
   white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .outliner-item:hover {
   background: var(--panel-2);
@@ -505,10 +524,13 @@ input[type="checkbox"] {
 /* Timeline + results (simulation) */
 .timeline {
   grid-area: time;
+  position: relative;
   display: flex;
   flex-direction: column;
+  min-width: 0;
   min-height: 0;
   background: var(--panel);
+  container: timeline / inline-size;
 }
 .timeline-bar {
   display: flex;
@@ -599,6 +621,8 @@ input[type="checkbox"] {
   box-shadow: inset 0 2px 0 var(--accent);
 }
 .result-page {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 0 8px 8px;
 }
@@ -786,4 +810,402 @@ td {
 
 #layer-status {
   white-space: pre-line;
+}
+
+/* Free-ratio controls of legacy designs; drawing designs are built from catalog parts instead. */
+body[data-format="drawing"] .legacy-only {
+  display: none;
+}
+details.advanced {
+  margin-top: 8px;
+}
+details.advanced > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--muted, #9aa0a6);
+}
+
+/* Name and size of the member under the pointer. */
+.hover-tip {
+  position: absolute;
+  pointer-events: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #15191bdd;
+  color: #f1f1f1;
+  font-size: 11px;
+  white-space: nowrap;
+  z-index: 5;
+}
+
+.assembly-dialog {
+  width: min(1400px, 96vw);
+  max-width: 96vw;
+  height: 92vh;
+  max-height: 92vh;
+  padding: 16px;
+  color: #eee;
+  background: #292929;
+  border: 1px solid #777;
+  border-radius: 8px;
+}
+.assembly-dialog::backdrop {
+  background: #000a;
+}
+.assembly-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.assembly-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(240px, 1fr);
+  gap: 16px;
+}
+#assembly-view {
+  height: 55vh;
+  min-height: 280px;
+  position: relative;
+}
+#assembly-view canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.assembly-instructions {
+  max-height: 72vh;
+  overflow: auto;
+}
+.assembly-instructions li {
+  margin-bottom: 8px;
+}
+#assembly-steps li button {
+  text-align: left;
+  white-space: normal;
+}
+#assembly-notes {
+  font-size: 12px;
+  color: #c9c9c9;
+}
+#assembly-caption {
+  min-height: 3em;
+}
+@media (max-width: 700px) {
+  .assembly-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .assembly-instructions {
+    max-height: 35vh;
+  }
+  #assembly-view {
+    height: 40vh;
+  }
+}
+
+.workspace[hidden] {
+  display: none;
+}
+.assembly-window {
+  position: fixed;
+  inset: 52px 8px 30px;
+  width: auto;
+  max-width: none;
+  height: auto;
+  max-height: none;
+  margin: 0;
+  z-index: 15;
+  overflow: auto;
+}
+#assembly-editing {
+  border: 1px solid #666;
+  border-radius: 6px;
+  margin: 0 0 12px;
+  padding: 10px;
+  min-width: 0;
+}
+#assembly-manual-tools[hidden],
+#assembly-auto-tools[hidden] {
+  display: none;
+}
+#assembly-manual-list {
+  padding: 0;
+  max-height: 32vh;
+  overflow: auto;
+}
+.assembly-manual-row {
+  display: grid;
+  grid-template-columns: 60px minmax(60px, 1fr) 34px 34px 50px;
+  gap: 4px;
+  align-items: center;
+}
+#assembly-order-input {
+  width: 100%;
+  resize: vertical;
+  box-sizing: border-box;
+}
+#assembly-manual-status {
+  font-size: 12px;
+}
+@media (max-width: 700px) {
+  .assembly-window {
+    inset: 88px 4px 26px;
+  }
+}
+
+:root[data-large-text="true"] {
+  font-size: 15px;
+}
+:root[data-theme="light"] {
+  --app: #eff1f4;
+  --panel: #ffffff;
+  --panel-2: #e9edf2;
+  --header: #e5e9ef;
+  --field: #fff;
+  --field-border: #a4afbc;
+  --line: #c3cad4;
+  --text: #202936;
+  --muted: #4c5a6d;
+  --accent: #8a4a00;
+  --accent-soft: #f8e6cb;
+  --button: #e5e9ef;
+  --button-hover: #d6dce5;
+  --good: #216441;
+  --bad: #a52626;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] {
+    --app: #eff1f4;
+    --panel: #ffffff;
+    --panel-2: #e9edf2;
+    --header: #e5e9ef;
+    --field: #fff;
+    --field-border: #a4afbc;
+    --line: #c3cad4;
+    --text: #202936;
+    --muted: #4c5a6d;
+    --accent: #8a4a00;
+    --accent-soft: #f8e6cb;
+    --button: #e5e9ef;
+    --button-hover: #d6dce5;
+    --good: #216441;
+    --bad: #a52626;
+    color-scheme: light;
+  }
+}
+:root[data-guides="false"] .shortcuts,
+:root[data-hover="false"] .hover-tip {
+  display: none;
+}
+:root[data-reduced-motion="true"] *,
+:root[data-reduced-motion="true"] *::before,
+:root[data-reduced-motion="true"] *::after {
+  animation: none;
+  transition: none;
+}
+.recovery-notice {
+  position: fixed;
+  bottom: 36px;
+  left: 16px;
+  z-index: 30;
+  padding: 12px;
+  max-width: calc(100vw - 32px);
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  box-shadow: 0 4px 20px #0004;
+}
+#app ~ .recovery-notice button {
+  margin-left: 8px;
+}
+#timber-distribution[hidden] {
+  display: none;
+}
+#stress-section,
+#stress-diagrams svg {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.local-fem-dialog {
+  width: min(1200px, 94vw);
+  max-width: 94vw;
+  max-height: 90vh;
+  overflow: auto;
+  background: #282828;
+  color: #eee;
+  border: 1px solid #888;
+  border-radius: 8px;
+}
+.local-fem-dialog::backdrop {
+  background: #0009;
+}
+.local-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  gap: 16px;
+}
+#local-canvas {
+  width: 100%;
+  height: auto;
+}
+.local-controls {
+  max-height: 64vh;
+  overflow: auto;
+}
+@media (max-width: 750px) {
+  .local-layout {
+    grid-template-columns: 1fr;
+  }
+  .local-controls {
+    max-height: none;
+  }
+}
+
+/* Pane boundaries: drag (or focus and use the arrow keys) to resize, double-click to restore the default. */
+.splitter {
+  position: absolute;
+  z-index: 4;
+  touch-action: none;
+}
+.splitter::after {
+  content: "";
+  position: absolute;
+  background: transparent;
+  transition: background 0.1s ease-out;
+}
+.splitter-x {
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  cursor: col-resize;
+}
+.splitter-x::after {
+  top: 0;
+  bottom: 0;
+  left: 3px;
+  width: 2px;
+}
+.splitter-y {
+  left: 0;
+  right: 0;
+  height: 8px;
+  cursor: row-resize;
+}
+.splitter-y::after {
+  left: 0;
+  right: 0;
+  top: 3px;
+  height: 2px;
+}
+.splitter[data-pane="outliner"] {
+  bottom: -5px;
+}
+.splitter[data-pane="time"] {
+  top: -5px;
+}
+.splitter:hover::after,
+.splitter.is-dragging::after,
+.splitter:focus-visible::after {
+  background: var(--accent);
+}
+.splitter:focus-visible {
+  outline: none;
+}
+body[data-resizing] {
+  user-select: none;
+}
+body[data-resizing="x"] {
+  cursor: col-resize;
+}
+body[data-resizing="y"] {
+  cursor: row-resize;
+}
+/* The 3D canvas must not steal the pointer while a boundary is dragged across it. */
+body[data-resizing] #viewport {
+  pointer-events: none;
+}
+@media (max-width: 900px) {
+  .splitter {
+    display: none;
+  }
+}
+
+/* Pane contents follow the size of their pane, not of the window. */
+.prop-pages,
+.chart-area,
+.result-page {
+  overflow-wrap: anywhere;
+}
+@container sidebar (max-width: 300px) {
+  .prop-pages {
+    padding: 8px 8px 14px;
+  }
+  .double,
+  .direction-pad {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .triple {
+    gap: 4px;
+  }
+  .triple input:not([type="checkbox"]):not([type="range"]) {
+    padding: 4px 4px;
+  }
+}
+@container sidebar (max-width: 260px) {
+  .triple {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@container sidebar (min-width: 460px) {
+  .prop-pages {
+    padding: 12px 16px 18px;
+  }
+  .direction-pad {
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  }
+  .hint,
+  label,
+  .assumptions p {
+    font-size: 12px;
+  }
+  .outliner-item,
+  .outliner-tree summary {
+    font-size: 12px;
+  }
+}
+@container viewer (max-width: 720px) {
+  .view-header {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .view-header .spacer {
+    display: none;
+  }
+}
+@container viewer (max-width: 520px) {
+  .shortcuts {
+    display: none;
+  }
+}
+@container timeline (max-width: 820px) {
+  .timeline-bar {
+    flex-wrap: wrap;
+  }
+  .timeline-fields {
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    flex: 1 1 100%;
+  }
+}
+@container timeline (max-width: 600px) {
+  .timeline-body {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    overflow-y: auto;
+  }
+  .chart-area {
+    border-right: 0;
+    border-bottom: 1px solid var(--line);
+  }
 }

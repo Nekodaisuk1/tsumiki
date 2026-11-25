@@ -151,6 +151,8 @@ test("schema, sample, report and rope topology editing", async ({ page, request 
   expect(report.suggestedFilename()).toBe("analysis.tsumiki-report.json");
   await showTab(page, "モデリング");
   await props(page, "ロープ");
+  // Hand editing of rope routes is folded away as a detail.
+  await page.getByText("経路を手で編集（詳細）").click();
   await page.getByRole("button", { name: "前面ロープだけ残す" }).click();
   await expect(page.locator("#counts")).toContainText("1ロープ");
   await page.locator("#route-d").selectOption("n5");
@@ -794,12 +796,21 @@ test("G turns a board on a tenon about that tenon and stops before a collision",
   const p = new THREE.Vector3(...pivot).project(camera);
   const at = { x: box.x + ((p.x + 1) * box.width) / 2, y: box.y + ((1 - p.y) * box.height) / 2 };
   const radius = 0.11875 * box.height;
-  // One drag turns about 45°; the second male blocks the board at about 76°, so the third drag stops short.
+  // TransformControls turns a ring by the drag (in world units) along axis × eye, times 20 / (camera
+  // distance) radians. A long drag winds round several times and where it ends depends on the canvas size,
+  // so drag along that direction just far enough for 45° (backwards: the turn toward the second male).
+  const pivotPoint = new THREE.Vector3(...pivot);
+  const eye = camera.position.clone().sub(pivotPoint).normalize();
+  const along = new THREE.Vector3(0, 0, 1).cross(eye).normalize();
+  const reach = ((Math.PI / 4) * camera.position.distanceTo(pivotPoint)) / 20;
+  const end = pivotPoint.clone().addScaledVector(along, -reach).project(camera);
+  const drag = { x: ((end.x - p.x) / 2) * box.width, y: (-(end.y - p.y) / 2) * box.height };
+  // One drag turns 45°; the second male blocks the board at about 85°, so the second drag stops short.
   const turns: number[] = [];
   for (let i = 0; i < 3; i++) {
     await page.mouse.move(at.x, at.y - radius);
     await page.mouse.down();
-    await page.mouse.move(at.x - 700, at.y - radius, { steps: 30 });
+    await page.mouse.move(at.x + drag.x, at.y - radius + drag.y, { steps: 30 });
     await page.mouse.up();
     await expect(page.getByRole("alert")).toBeHidden();
     const text = (await page.locator("#status").textContent()) ?? "";
@@ -1025,5 +1036,355 @@ test("a 2400 board switches hole pitch and the panel names pitch changes of the 
   await page.locator("#member-dimensions").click();
   await page.keyboard.press("p");
   await expect(pitch).toHaveText("穴の間隔を 140.25mm（140.25ピッチ版）に");
+  expect(errors).toEqual([]);
+});
+
+test("a refused placement shows a red ghost where the part would go, with the reason", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  for (const hole of ["2", "3"]) {
+    await page.locator("#hole-female").selectOption("m0");
+    await page.locator("#hole-number").selectOption(hole);
+    await page.getByRole("button", { name: "③ 雄材を差し込む", exact: true }).click();
+  }
+  await expect(page.locator("#counts")).toContainText("3部材");
+  // From the tip of the first male toward the second, tilted so the board misses the second tenon's hole.
+  await props(page, "節点");
+  await page.locator("#node").selectOption("n3");
+  await props(page, "追加");
+  await page.getByRole("button", { name: "▣ 雌材", exact: true }).click();
+  await page.getByRole("button", { name: "+X 右へ" }).click();
+  await page.locator("#female-tilt").fill("5");
+  await page.locator("#female-tilt").dispatchEvent("input");
+  await expect(page.locator("#quick-add")).toBeDisabled();
+  await expect(page.locator("#female-preview-status")).toContainText("干渉");
+  await page.screenshot({ path: "test-results/refused-placement.png" });
+  expect(errors).toEqual([]);
+});
+
+test("keyboard building: chained templates, arrows, undo note, labels, picking, copies and repeats", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  await page.locator("#hole-number").selectOption("0");
+  await page.getByRole("button", { name: "③ 雄材を差し込む", exact: true }).click();
+  const counts = page.locator("#counts");
+  await expect(counts).toContainText("2部材");
+  // Templates: pick the base once, then arrow + Enter, and Enter again continues from the new male.
+  await page.keyboard.press("t");
+  await page.locator('#outliner .outliner-item[data-id="m1"]').click();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#template-status")).toContainText("雄材1本・雌材2枚");
+  await page.keyboard.press("Enter");
+  await expect(counts).toContainText("5部材");
+  await expect(page.locator("#status")).toContainText("続けて雄材");
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press("Enter");
+  await expect(counts).toContainText("8部材");
+  // Shift+R repeats the last template from the newest male.
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Shift+R");
+  await expect(counts).toContainText("11部材");
+  // Undo says what came back or went away.
+  await page.keyboard.press("Control+z");
+  await expect(page.locator("#status")).toContainText("元に戻しました");
+  await expect(page.locator("#status")).toContainText("がなくなりました");
+  await expect(counts).toContainText("8部材");
+  // Outliner rows name the drawing size, direction and layer.
+  await expect(page.locator("#outliner")).toContainText("1200♀角 · X方向 · 0段");
+  await expect(page.locator("#outliner")).toContainText("1200♂ · Z向き");
+  // Shift+click picks several members; Shift+D copies them, the arrows move the copy, Enter places it.
+  const boards = await page
+    .locator("#outliner .outliner-item", { hasText: "1200♀角 · Y方向" })
+    .evaluateAll((items) => items.map((i) => (i as HTMLElement).dataset.id ?? ""));
+  expect(boards.length).toBeGreaterThan(1);
+  // Shift+R left the template tool open to keep growing; close it to pick members.
+  await page.keyboard.press("Escape");
+  await page.locator(`#outliner .outliner-item[data-id="${boards[0]}"]`).click();
+  await page.locator(`#outliner .outliner-item[data-id="${boards[1]}"]`).click({ modifiers: ["Shift"] });
+  await expect(page.locator("#selection-summary")).toContainText("部材 2本");
+  await page.keyboard.press("Shift+D");
+  await expect(page.locator("#shortcuts")).toContainText("Enter写しを置く");
+  await page.keyboard.press("ArrowLeft");
+  await expect(page.locator("#tool-hint")).toContainText("写しのずれ");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#status")).toContainText("複製しました");
+  const afterCopy = Number((await counts.textContent())?.match(/(\d+)部材/)?.[1]);
+  // Shift+R places the same shift again from the copy.
+  await page.keyboard.press("Shift+R");
+  await expect(page.locator("#status")).toContainText("複製をもう一度");
+  await expect(counts).toContainText(`${afterCopy + 2}部材`);
+  // The picked copy deletes in one go.
+  await page.keyboard.press("x");
+  await expect(counts).toContainText(`${afterCopy}部材`);
+  expect(errors).toEqual([]);
+});
+
+test("a copy can be the mirror image joined at the end of the parts", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  await page.getByRole("button", { name: "＋ 新規", exact: true }).click();
+  await page.locator("#hole-number").selectOption("0");
+  await page.getByRole("button", { name: "③ 雄材を差し込む", exact: true }).click();
+  const counts = page.locator("#counts");
+  await page.keyboard.press("t");
+  await page.locator('#outliner .outliner-item[data-id="m1"]').click();
+  await page.keyboard.press("ArrowRight");
+  await page.keyboard.press("Enter");
+  await expect(counts).toContainText("5部材");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+  // Pick the bay: both males and its two boards, not the base board.
+  const bay = await page
+    .locator("#outliner .outliner-item")
+    .evaluateAll((items) =>
+      items.map((i) => (i as HTMLElement).dataset.id ?? "").filter((id) => /^m\d+$/.test(id) && id !== "m0"),
+    );
+  expect(bay).toHaveLength(4);
+  await page.locator(`#outliner .outliner-item[data-id="${bay[0]}"]`).click();
+  for (const id of bay.slice(1))
+    await page.locator(`#outliner .outliner-item[data-id="${id}"]`).click({ modifiers: ["Shift"] });
+  await expect(page.locator("#selection-summary")).toContainText("部材 4本");
+  await page.keyboard.press("Shift+D");
+  await expect(page.locator("#shortcuts")).toContainText("鏡写し");
+  await page.keyboard.press("f");
+  await expect(page.locator("#tool-hint")).toContainText("端の向きを選んで");
+  // Clicking a male makes it the end, facing away from the copied parts: m1 is the left end.
+  await page.locator('#outliner .outliner-item[data-id="m1"]').click();
+  await expect(page.locator("#tool-hint")).toContainText("雄材 m1で反転");
+  await expect(page.locator("#tool-hint")).toContainText("3本を追加します");
+  // A board cannot be the end; clicking m1 again goes back to the outermost end.
+  await page
+    .locator("#outliner .outliner-item", { hasText: "♀" })
+    .filter({ hasNotText: "2400" })
+    .first()
+    .click();
+  await expect(page.locator("#tool-hint")).toContainText("雄材をクリックしてください");
+  await page.locator('#outliner .outliner-item[data-id="m1"]').click();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.locator("#tool-hint")).toContainText("x の一番端で反転");
+  // The end male is shared, so only its far image and the two boards are new.
+  await expect(page.locator("#tool-hint")).toContainText("3本を追加します");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert")).toBeHidden();
+  await expect(page.locator("#status")).toContainText("鏡写しで端につなぎました");
+  await expect(counts).toContainText("8部材");
+  // Shift+R mirrors the image again at its own end.
+  await page.keyboard.press("Shift+R");
+  await expect(page.locator("#status")).toContainText("鏡写しをもう一度");
+  await expect(counts).toContainText("11部材");
+  expect(errors).toEqual([]);
+});
+
+test("boards can be coloured by their seat on the tenon, switched with Z like Blender shading", async ({
+  page,
+}) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  const legend = page.locator("#layer-legend");
+  await expect(legend).toBeHidden();
+  await expect(page.locator("#color-material")).toHaveAttribute("aria-pressed", "true");
+  await page.keyboard.press("z");
+  await expect(page.locator("#color-layer")).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator("#color-material")).toHaveAttribute("aria-pressed", "false");
+  await expect(legend).toBeVisible();
+  await expect(legend).toContainText("0段");
+  await expect(legend).toContainText("3段");
+  // Undo is still Ctrl+Z, not the colour switch.
+  await page.keyboard.press("Control+z");
+  await expect(page.locator("#color-layer")).toHaveAttribute("aria-pressed", "true");
+  await page.getByRole("button", { name: "材", exact: true }).click();
+  await expect(legend).toBeHidden();
+  await page.getByRole("button", { name: "段", exact: true }).click();
+  await expect(legend).toBeVisible();
+  // It stays on in the simulation screen too.
+  await page.keyboard.press("2");
+  await expect(legend).toBeVisible();
+  expect(errors).toEqual([]);
+});
+
+test("a double-click or L selects the whole structure joined to a member", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  const total = Number((await page.locator("#counts").textContent())?.match(/(\d+)部材/)?.[1]);
+  expect(total).toBeGreaterThan(2);
+  const summary = page.locator("#selection-summary");
+  await page.locator("#outliner .outliner-item").first().click();
+  await expect(summary).not.toContainText("本");
+  await page.keyboard.press("l");
+  await expect(summary).toContainText(`部材 ${total}本`);
+  await expect(page.locator("#tool-hint")).toContainText(`つながっている部材 ${total}本`);
+  await page.keyboard.press("Escape");
+  // Find a member under the pointer by its hover tip (shown on the next frame), then double-click it.
+  const box = await page.locator("#viewport canvas").boundingBox();
+  if (!box) throw new Error("no canvas");
+  const tip = page.locator("#hover-tip");
+  const frame = () =>
+    page.evaluate(() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done))));
+  let spot: { x: number; y: number } | null = null;
+  for (let fy = 0.3; fy <= 0.7 && !spot; fy += 0.05)
+    for (let fx = 0.3; fx <= 0.7 && !spot; fx += 0.05) {
+      const x = box.x + box.width * fx;
+      const y = box.y + box.height * fy;
+      await page.mouse.move(x, y);
+      await frame();
+      if (await tip.isVisible()) spot = { x, y };
+    }
+  if (!spot) throw new Error("no member found under the pointer");
+  await expect(summary).not.toContainText("本");
+  await page.mouse.dblclick(spot.x, spot.y);
+  await expect(summary).toContainText(`部材 ${total}本`);
+  expect(errors).toEqual([]);
+});
+
+test("a copy can be locked to the X, Y or Z axis and shifted by typed millimetres", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await ready(page);
+  const counts = page.locator("#counts");
+  const total = Number((await counts.textContent())?.match(/(\d+)部材/)?.[1]);
+  const hint = page.locator("#tool-hint");
+  await page.locator("#outliner .outliner-item").first().click();
+  await page.keyboard.press("l");
+  await page.keyboard.press("Shift+D");
+  await expect(page.locator("#shortcuts")).toContainText("軸を固定");
+  // Z locks the axis instead of switching the colours.
+  await page.keyboard.press("z");
+  await expect(hint).toContainText("Z軸に固定");
+  await expect(page.locator("#color-material")).toHaveAttribute("aria-pressed", "true");
+  // With the axis locked, the up arrow moves along Z, not Y.
+  await page.keyboard.press("ArrowUp");
+  await expect(hint).toContainText(/Z軸 \d/);
+  // Pressing X moves the lock and drops the shift along Z; typed digits give the shift in mm.
+  await page.keyboard.press("x");
+  await expect(hint).toContainText("X軸に固定");
+  await page.keyboard.type("5000");
+  await expect(hint).toContainText("X軸 5000▏");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.press("-");
+  await expect(hint).toContainText("X軸 -500▏");
+  await page.keyboard.type("0");
+  await expect(hint).toContainText(`${total}本を追加します`);
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#status")).toContainText("複製しました");
+  await expect(counts).toContainText(`${total * 2}部材`);
+  // The typed digits never reached the screen keys.
+  await expect(page.locator("#viewer-title")).toContainText("設計");
+  expect(errors).toEqual([]);
+});
+
+test("an arrow passes over places where copied tenons would meet in one hole", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto("/");
+  const d = createDrawingDesign();
+  const { nodeId: tip } = insertMaleAtHole(d, "m0", 4, catalogPart("male-1200").span, -1);
+  const z = d.nodes.find((n) => n.id === tip)?.position[2] ?? 0;
+  await page.locator("#file").setInputFiles({
+    name: "tower.tsumiki.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(d)),
+  });
+  const counts = page.locator("#counts");
+  await expect(counts).toContainText("2部材");
+  const hint = page.locator("#tool-hint");
+  await page.locator('#outliner .outliner-item[data-id="m0"]').click();
+  await page.keyboard.press("l");
+  await page.keyboard.press("Shift+D");
+  await page.keyboard.press("z");
+  // Typed onto the male's tip, the copied male's tenon meets the original's in one hole.
+  await page.keyboard.type(String(Math.round(z * 1000 * 100) / 100));
+  await expect(hint).toContainText(/置けません（雄材 m1 と 写しのm\d+ の凸の先同士がぶつかります/);
+  // The arrow goes past those places to the first one, a whole number of hole pitches on, where it fits.
+  await page.keyboard.press("ArrowUp");
+  await page.keyboard.press(z < 0 ? "ArrowDown" : "ArrowUp");
+  await expect(hint).toContainText("ぶつかる位置を飛ばしました");
+  const shift = Number((await hint.textContent())?.match(/Z軸 (-?[\d.]+)/)?.[1]);
+  expect(Math.abs(shift)).toBeGreaterThan(Math.abs(z * 1000) + 330);
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#status")).toContainText("複製しました");
+  await expect(counts).toContainText("4部材");
+  expect(errors).toEqual([]);
+});
+
+test("an arrow stops where a drawing male can join the copy to the board in place", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto("/");
+  await page.locator("#file").setInputFiles({
+    name: "board.tsumiki.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(createDrawingDesign())),
+  });
+  const counts = page.locator("#counts");
+  await expect(counts).toContainText("1部材");
+  const hint = page.locator("#tool-hint");
+  await page.locator('#outliner .outliner-item[data-id="m0"]').click();
+  await page.keyboard.press("Shift+D");
+  await page.keyboard.press("z");
+  // The nearest such place: the shortest male between the board and its copy, both on its first seat.
+  await page.keyboard.press("ArrowUp");
+  const male = catalogPart("male-300");
+  const gap = Math.round((male.span + 0.03) * 1000 * 100) / 100;
+  await expect(hint).toContainText(`Z軸 ${gap} mm`);
+  await expect(hint).toContainText(`${male.label}（`);
+  await expect(hint).toContainText("で元の部材とつなげる位置");
+  await page.keyboard.press("Enter");
+  await expect(counts).toContainText("2部材");
+  // That male, pushed from the board's hole toward the copy, goes into the facing hole of the copy.
+  await page.locator('.prop-tab[data-page="add"]').click();
+  await page.locator("#palette-male").click();
+  await page.locator("#male-catalog").selectOption(male.id);
+  await page.locator("#hole-female").selectOption("m0");
+  await page.locator("#hole-number").selectOption("4");
+  let joined = false;
+  for (const side of ["1", "-1"]) {
+    await page.locator("#male-side").selectOption(side);
+    if (await page.locator("#insert-male").isDisabled()) continue;
+    await page.locator("#insert-male").click();
+    joined = (await counts.textContent())?.includes("2穴接続") ?? false;
+    if (joined) break;
+    await page.keyboard.press("Control+z");
+  }
+  expect(joined).toBe(true);
+  await expect(counts).toContainText("3部材");
+  expect(errors).toEqual([]);
+});
+
+test("a copied board stops on the far tenon of a male and is joined there", async ({ page }) => {
+  const errors: string[] = [];
+  page.on("pageerror", (e) => errors.push(e.message));
+  await page.goto("/");
+  const d = createDrawingDesign();
+  const { memberId: male, nodeId: tip } = insertMaleAtHole(d, "m0", 4, catalogPart("male-1200").span, -1);
+  const z = d.nodes.find((n) => n.id === tip)?.position[2] ?? 0;
+  await page.locator("#file").setInputFiles({
+    name: "tenon.tsumiki.json",
+    mimeType: "application/json",
+    buffer: Buffer.from(JSON.stringify(d)),
+  });
+  const counts = page.locator("#counts");
+  await expect(counts).toContainText("2部材");
+  await page.locator('#outliner .outliner-item[data-id="m0"]').click();
+  await page.keyboard.press("Shift+D");
+  await page.keyboard.press("z");
+  // One arrow toward the male goes straight to its far tenon tip, not one hole pitch.
+  await page.keyboard.press(z < 0 ? "ArrowDown" : "ArrowUp");
+  await expect(page.locator("#tool-hint")).toContainText(`Z軸 ${Math.round(z * 1000 * 100) / 100}`);
+  await expect(page.locator("#tool-hint")).toContainText("1本を追加します");
+  await page.keyboard.press("Enter");
+  await expect(page.locator("#status")).toContainText("複製しました");
+  await expect(counts).toContainText("3部材");
+  await expect(counts).toContainText("2穴接続");
+  expect(male).toBe("m1");
   expect(errors).toEqual([]);
 });

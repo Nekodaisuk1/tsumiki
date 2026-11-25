@@ -50,6 +50,8 @@ test("shows the rounded-end drawing and rejects an undersized corner radius at i
   await page.locator("#top").click();
   await page.locator("#nodes-visible").uncheck();
   await page.screenshot({ path: "test-results/hitoto-round-board.png" });
+  // The corner radius is a design setting, on the design page.
+  await page.getByRole("tab", { name: "設計のプロパティ" }).click();
   await page.locator("#tenon-radius").fill("0");
   await page.locator("#apply-tenon-radius").click();
   await expect(page.locator("#insert-male")).toBeDisabled();

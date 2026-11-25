@@ -1,11 +1,16 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
+import { layerColors, STANDARD_LAYER_COLORS } from "../color-palette";
+import { defaults, type Preferences } from "../preferences";
+import type { AssemblyPlan } from "./assembly";
 import type { Design, Vec3 } from "./design";
 import type { EngineeringResult } from "./engineering";
 import { femaleGeometry, femaleLayerSign, maleGeometry, memberFrame, ringGeometry } from "./geometry";
 import { holeOccupied, holeSite } from "./holes";
 import { detectRopeFrames, type RopeFrame, ropeAttachments } from "./rope";
+import { stressEnvelope } from "./stress";
+import { applyWoodTexture, createWoodTexture, type WoodTextures } from "./wood-texture";
 
 /** What the move gizmo drags: its pivot, the parts that follow it live, and the snapping. */
 export type TransformSpec = {
@@ -29,7 +34,71 @@ export type GizmoMotion = { translate: Vec3; axis: Vec3; angle: number; pivot: V
 /** Moving ends closer than this to a node that stays put jump onto it. */
 const MAGNET = 0.06;
 
+export type ColorMode = "material" | "layer";
+/** Board colours by seat on the tenon, innermost (next to the male body) first; also used by the legend. */
+/** Colour and direction of the guide line per axis, matching the axis legend (X red, Y green, Z blue). */
+const AXIS_GUIDE: Record<"x" | "y" | "z", { color: number; direction: Vec3 }> = {
+  x: { color: 0xe5534b, direction: [1, 0, 0] },
+  y: { color: 0x6cc24a, direction: [0, 1, 0] },
+  z: { color: 0x4a8fe7, direction: [0, 0, 1] },
+};
+/** How far the guide line reaches each way from the centre; beyond the 12-unit floor grid. */
+const AXIS_GUIDE_REACH = 50;
+export const LAYER_COLORS = STANDARD_LAYER_COLORS;
 export class Viewport {
+  private preferences: Preferences = { ...defaults };
+  private grid = new THREE.GridHelper(12, 48, 0x5e5e5e, 0x474747);
+  private axes = new THREE.AxesHelper(0.65);
+  applyPreferences(settings: Preferences) {
+    this.preferences = settings;
+    this.controls.rotateSpeed = settings.rotateSpeed;
+    this.controls.panSpeed = settings.panSpeed;
+    this.controls.zoomSpeed = settings.zoomSpeed;
+    this.controls.enableDamping = settings.inertia && !settings.reducedMotion;
+    this.controls.zoomToCursor = settings.cursorZoom;
+    this.grid.visible = settings.grid;
+    this.axes.visible = settings.axes;
+    this.renderer.setPixelRatio(
+      Math.min(window.devicePixelRatio, settings.quality === "low" ? 1 : settings.quality === "high" ? 3 : 2),
+    );
+    const light =
+      settings.theme === "light" ||
+      (settings.theme === "system" && matchMedia("(prefers-color-scheme: light)").matches);
+    this.renderer.setClearColor(light ? "#e3e6e9" : "#3a3a3a");
+    this.setWoodMode(settings.surface === "wood");
+  }
+
+  private woodAmbient = new THREE.HemisphereLight(0xfff5e8, 0x586779, 2.5);
+  private woodKey = new THREE.DirectionalLight(0xfff4e3, 3);
+  private woodGround = new THREE.Mesh(
+    new THREE.PlaneGeometry(100, 100),
+    new THREE.ShadowMaterial({ opacity: 0.24 }),
+  );
+  private woodTexture: WoodTextures | null = null;
+  setWoodMode(enabled: boolean) {
+    const active = enabled && this.colorMode === "material" && !this.engineering;
+    this.renderer.shadowMap.enabled = active && this.preferences.quality !== "low";
+    this.woodKey.castShadow = active && this.preferences.quality !== "low";
+    this.woodGround.visible = active;
+    this.woodAmbient.color.setHex(active ? 0xfff5e8 : 0xffffff);
+    this.woodAmbient.groundColor.setHex(active ? 0x586779 : 0x62745a);
+    this.woodKey.color.setHex(active ? 0xfff4e3 : 0xffffff);
+    this.woodAmbient.intensity = active ? 1.1 : 2.5;
+    this.woodKey.intensity = active ? 2.8 : 3;
+    if (!active) {
+      this.woodKey.position.set(3, 6, 4);
+      this.woodKey.target.position.set(0, 0, 0);
+    }
+    this.renderer.toneMapping = active ? THREE.ACESFilmicToneMapping : THREE.NoToneMapping;
+    this.renderer.toneMappingExposure = active ? 1.15 : 1;
+    if (active && !this.woodTexture) this.woodTexture = createWoodTexture();
+    if (!active && this.woodTexture) {
+      this.woodTexture.dispose();
+      this.woodTexture = null;
+      this.woodKey.shadow.map?.dispose();
+      this.woodKey.shadow.map = null;
+    }
+  }
   private engineering: EngineeringResult | null = null;
   setEngineering(result: EngineeringResult | null) {
     this.engineering = result;
@@ -41,6 +110,13 @@ export class Viewport {
   private transform: TransformControls;
   private anchor = new THREE.Object3D();
   private group = new THREE.Group();
+  /**
+   * Member shapes by drawing size, shared by every member of that size and kept across redraws: building
+   * the extruded boards with their holes was most of the cost of a redraw. Entries a redraw does not use
+   * are disposed at its end.
+   */
+  private shapes = new Map<string, THREE.BufferGeometry[]>();
+  private shapesUsed = new Set<string>();
   private targets: THREE.Object3D[] = [];
   private current: Design | null = null;
   private editing = true;
@@ -49,7 +125,10 @@ export class Viewport {
   /** Gizmo orientation before the drag; a hinge turns the gizmo so its Z ring lies about the hinge axis. */
   private base = new THREE.Quaternion();
   onSelect: (id: string) => void = () => {};
-  onMemberSelect: (id: string) => void = () => {};
+  /** `additive` is true for Shift+click, which adds to or removes from a multiple selection. */
+  onMemberSelect: (id: string, additive: boolean) => void = () => {};
+  /** Double-click on a member or node: select the whole structure it belongs to (`additive` with Shift). */
+  onLinkSelect: (kind: "member" | "node", id: string, additive: boolean) => void = () => {};
   onRingSelect: (id: string) => void = () => {};
   /** Called once when a gizmo drag ends with a non-zero motion. */
   onTransform: (motion: GizmoMotion) => void = () => {};
@@ -59,14 +138,22 @@ export class Viewport {
   onHoleSelect: (female: string, hole: number) => void = () => {};
   private choosingHole = false;
   private chosenHole: { female: string; hole: number } | null = null;
-  private preview: { start: Vec3; end: Vec3 } | null = null;
+  private preview: { start: Vec3; end: Vec3; blocked?: boolean } | null = null;
   private hovered = "";
   private ghosts = new Set<string>();
   private marked = new Set<string>();
   private anchors = new Set<string>();
   /** Members drawn as a translucent placement preview (not pickable). */
-  setGhosts(members: string[]) {
+  private ghostsBlocked = false;
+  /** Preview members; `blocked` draws them red when the part cannot be placed there. */
+  setGhosts(members: string[], blocked = false) {
     this.ghosts = new Set(members);
+    this.ghostsBlocked = blocked;
+  }
+  private colorMode: ColorMode = "material";
+  /** How boards are coloured: by material, or by the seat (layer) they take on the male's tenon. */
+  setColorMode(mode: ColorMode) {
+    this.colorMode = mode;
   }
   /** Members picked as the base of the active tool; they glow softly until released. */
   setMarked(members: string[]) {
@@ -76,6 +163,11 @@ export class Viewport {
   /** The ends of the selected board for catalog resizing: an arrow on the end that moves, a lock on the other. */
   setResizeHint(hint: { moving: string; fixed: string } | null) {
     this.resizeHint = hint;
+  }
+  private axisGuide: { axis: "x" | "y" | "z"; point: Vec3 } | null = null;
+  /** A line along the axis a copy is locked to, through the centre of the copied parts (as in Blender). */
+  setAxisGuide(guide: { axis: "x" | "y" | "z"; point: Vec3 } | null) {
+    this.axisGuide = guide;
   }
   /** Nodes offered as starting points for the active tool. */
   setAnchorChoices(nodes: string[]) {
@@ -87,7 +179,15 @@ export class Viewport {
   setHover(member: string) {
     this.hovered = member;
   }
+  /** Called with the member under the pointer (or "" when none), for a small label near the cursor. */
+  onPointerMember: (member: string, x: number, y: number) => void = () => {};
+  private pointerMember = "";
   private selectedMember = "";
+  private picked = new Set<string>();
+  /** Members picked together with Shift+click; they are shown selected like the current member. */
+  setPicked(members: string[]) {
+    this.picked = new Set(members);
+  }
   private winder = "";
   /** The male chosen to wind the rope being set up; it glows in the rope colour. */
   setWinder(member: string) {
@@ -95,7 +195,7 @@ export class Viewport {
   }
   /** Short flash on members that just snapped into place or got a rope. */
   pulse(members: string[]) {
-    this.pulseIds = new Set(members);
+    this.pulseIds = new Set(this.preferences.reducedMotion ? [] : members);
     this.pulseStart = performance.now();
   }
   private applyEmphasis(now: number) {
@@ -114,7 +214,7 @@ export class Viewport {
         material.emissiveIntensity = 0.7;
         continue;
       }
-      if (member === this.selectedMember) {
+      if (member === this.selectedMember || this.picked.has(member)) {
         material.emissive.setHex(0xff9a2e);
         material.emissiveIntensity = Math.max(0.55, this.pulseIds.has(member) ? flash : 0);
         continue;
@@ -131,7 +231,7 @@ export class Viewport {
   setHoleSelection(
     choosing: boolean,
     chosen: { female: string; hole: number } | null,
-    preview: { start: Vec3; end: Vec3 } | null,
+    preview: { start: Vec3; end: Vec3; blocked?: boolean } | null,
   ) {
     this.choosingHole = choosing;
     this.chosenHole = chosen;
@@ -160,16 +260,24 @@ export class Viewport {
     this.controls = new OrbitControls(this.camera, this.renderer.domElement);
     this.controls.target.set(0.7, 0.6, 0.5);
     this.controls.enableDamping = true;
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0x62745a, 2.5));
-    const light = new THREE.DirectionalLight(0xffffff, 3);
+    this.scene.add(this.woodAmbient);
+    const light = this.woodKey;
     light.position.set(3, 6, 4);
     this.scene.add(light);
-    const grid = new THREE.GridHelper(12, 48, 0x5e5e5e, 0x474747);
+    this.scene.add(light.target);
+    light.shadow.mapSize.set(1024, 1024);
+    light.shadow.normalBias = 0.002;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
+    this.woodGround.rotation.x = -Math.PI / 2;
+    this.woodGround.receiveShadow = true;
+    this.woodGround.visible = false;
+    this.scene.add(this.woodGround);
+    const grid = this.grid;
     grid.position.y = -0.3;
     this.scene.add(grid);
     this.scene.add(this.group);
     this.scene.add(this.anchor);
-    const axes = new THREE.AxesHelper(0.65);
+    const axes = this.axes;
     axes.position.set(-0.4, -0.28, -0.4);
     this.scene.add(axes);
     this.transform = new TransformControls(this.camera, this.renderer.domElement);
@@ -194,6 +302,57 @@ export class Viewport {
       sy = e.clientY;
       dragged = this.transform.dragging;
     });
+    // Report the member under the pointer, at most once per frame, while no button is held.
+    let pending: PointerEvent | null = null;
+    this.renderer.domElement.addEventListener("pointermove", (e) => {
+      if (e.buttons) return;
+      const first = !pending;
+      pending = e;
+      if (!first) return;
+      requestAnimationFrame(() => {
+        const event = pending;
+        pending = null;
+        if (!event) return;
+        this.flush();
+        const r = this.renderer.domElement.getBoundingClientRect();
+        const ray = new THREE.Raycaster();
+        ray.setFromCamera(
+          new THREE.Vector2(
+            ((event.clientX - r.left) / r.width) * 2 - 1,
+            (-(event.clientY - r.top) / r.height) * 2 + 1,
+          ),
+          this.camera,
+        );
+        const hit = ray.intersectObjects(this.targets.filter((o) => o.userData.member))[0];
+        const member = hit ? String(hit.object.userData.member) : "";
+        if (member !== this.pointerMember) this.hovered = member;
+        this.pointerMember = member;
+        this.onPointerMember(member, event.clientX - r.left, event.clientY - r.top);
+      });
+    });
+    this.renderer.domElement.addEventListener("dblclick", (e) => {
+      if (this.choosingHole || this.choosingFrame || this.transform.dragging) return;
+      // The first click may have rebuilt the scene; place the new meshes before casting the ray.
+      this.flush();
+      this.scene.updateMatrixWorld();
+      const r = this.renderer.domElement.getBoundingClientRect();
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(
+        new THREE.Vector2(
+          ((e.clientX - r.left) / r.width) * 2 - 1,
+          (-(e.clientY - r.top) / r.height) * 2 + 1,
+        ),
+        this.camera,
+      );
+      const hit = ray.intersectObjects(this.targets.filter((o) => o.userData.member || o.userData.node))[0];
+      if (hit?.object.userData.node) this.onLinkSelect("node", String(hit.object.userData.node), e.shiftKey);
+      else if (hit) this.onLinkSelect("member", String(hit.object.userData.member), e.shiftKey);
+    });
+    this.renderer.domElement.addEventListener("pointerleave", () => {
+      if (this.pointerMember) this.hovered = "";
+      this.pointerMember = "";
+      this.onPointerMember("", 0, 0);
+    });
     this.renderer.domElement.addEventListener("pointerup", (e) => {
       if (
         dragged ||
@@ -202,6 +361,7 @@ export class Viewport {
         this.transform.axis
       )
         return;
+      this.flush();
       const r = this.renderer.domElement.getBoundingClientRect();
       const point = new THREE.Vector2(
         ((e.clientX - r.left) / r.width) * 2 - 1,
@@ -221,12 +381,15 @@ export class Viewport {
         this.onHoleSelect(String(hit.object.userData.female), Number(hit.object.userData.hole));
       else if (hit.object.userData.frame) this.onFrameSelect(String(hit.object.userData.frame));
       else if (hit.object.userData.node) this.onSelect(String(hit.object.userData.node));
-      else if (hit.object.userData.member) this.onMemberSelect(String(hit.object.userData.member));
+      else if (hit.object.userData.member)
+        this.onMemberSelect(String(hit.object.userData.member), e.shiftKey);
       else if (hit.object.userData.ring) this.onRingSelect(String(hit.object.userData.ring));
     });
     new ResizeObserver(() => this.resize()).observe(host);
     this.resize();
     this.renderer.setAnimationLoop(() => {
+      if (!this.host.offsetWidth || !this.host.offsetHeight) return;
+      this.flush();
       this.controls.update();
       this.applyEmphasis(performance.now());
       this.renderer.render(this.scene, this.camera);
@@ -252,6 +415,7 @@ export class Viewport {
     if (!this.spec) this.transform.detach();
   }
   private collectFollowers() {
+    this.flush();
     const spec = this.spec;
     if (!spec || !this.current) return;
     const members = new Set(spec.members);
@@ -304,22 +468,25 @@ export class Viewport {
   private magnet(delta: THREE.Vector3) {
     const spec = this.spec;
     if (!spec || spec.all || !this.current) return;
-    const moving = this.current.nodes.filter((n) => spec.nodes.includes(n.id));
-    const still = this.current.nodes.filter((n) => !spec.nodes.includes(n.id));
-    let best: THREE.Vector3 | null = null;
-    let bestDistance = MAGNET;
-    for (const a of moving) {
-      const p = new THREE.Vector3(...a.position).add(delta);
-      for (const b of still) {
-        const q = new THREE.Vector3(...b.position);
-        const distance = p.distanceTo(q);
+    // Runs on every pointer move of a drag, over moving × still nodes: plain arithmetic, no allocation.
+    const moved = new Set(spec.nodes);
+    const moving = this.current.nodes.filter((n) => moved.has(n.id));
+    const still = this.current.nodes.filter((n) => !moved.has(n.id));
+    let best: { a: Vec3; b: Vec3 } | null = null;
+    let bestDistance = MAGNET * MAGNET;
+    for (const { position: a } of moving) {
+      const px = a[0] + delta.x;
+      const py = a[1] + delta.y;
+      const pz = a[2] + delta.z;
+      for (const { position: b } of still) {
+        const distance = (px - b[0]) ** 2 + (py - b[1]) ** 2 + (pz - b[2]) ** 2;
         if (distance < bestDistance) {
           bestDistance = distance;
-          best = q.sub(new THREE.Vector3(...a.position));
+          best = { a, b };
         }
       }
     }
-    if (best) delta.copy(best);
+    if (best) delta.set(best.b[0] - best.a[0], best.b[1] - best.a[1], best.b[2] - best.a[2]);
   }
   /** Rotation of the gizmo since the drag started. */
   private turn() {
@@ -346,15 +513,38 @@ export class Viewport {
     this.camera.aspect = w / Math.max(h, 1);
     this.camera.updateProjectionMatrix();
   }
+  private shape(key: string, build: () => THREE.BufferGeometry[]) {
+    this.shapesUsed.add(key);
+    let shapes = this.shapes.get(key);
+    if (!shapes) {
+      shapes = build();
+      for (const g of shapes) g.userData.shared = true;
+      this.shapes.set(key, shapes);
+    }
+    return shapes;
+  }
   private clear() {
     this.group.traverse((o) => {
+      if (o instanceof THREE.Sprite) {
+        o.material.map?.dispose();
+        o.material.dispose();
+      }
       if (o instanceof THREE.Mesh || o instanceof THREE.Line) {
-        o.geometry.dispose();
+        if (!o.geometry.userData.shared) o.geometry.dispose();
         for (const material of Array.isArray(o.material) ? o.material : [o.material]) material.dispose();
       }
     });
     this.group.clear();
     this.targets = [];
+  }
+  private placementColor(blocked: boolean) {
+    return this.preferences.palette === "okabe-ito"
+      ? blocked
+        ? 0xe69f00
+        : 0x56b4e9
+      : blocked
+        ? 0xd9534f
+        : 0x3d9d86;
   }
   private mesh(
     geometry: THREE.BufferGeometry,
@@ -369,13 +559,22 @@ export class Viewport {
       geometry,
       ghost
         ? new THREE.MeshStandardMaterial({
-            color: 0x3d9d86,
+            color: this.placementColor(this.ghostsBlocked),
             transparent: true,
-            opacity: 0.45,
+            opacity: this.ghostsBlocked ? 0.3 : 0.45,
             depthWrite: false,
           })
         : new THREE.MeshStandardMaterial({ color, roughness: 0.8 }),
     );
+    if (!ghost && this.woodTexture) {
+      // The grain is laid out per member in the geometry's UVs, so a shared shape gets its own copy.
+      if (geometry.userData.shared) {
+        mesh.geometry = geometry.clone();
+        mesh.geometry.userData.shared = false;
+      }
+      applyWoodTexture(mesh.geometry, mesh.material, this.woodTexture, tag.member ?? tag.ring ?? "wood");
+    }
+    mesh.castShadow = mesh.receiveShadow = !!this.woodTexture && !ghost;
     mesh.position.copy(position);
     mesh.quaternion.copy(rotation);
     this.group.add(mesh);
@@ -387,7 +586,8 @@ export class Viewport {
       const outline = new THREE.LineSegments(
         new THREE.EdgesGeometry(geometry),
         new THREE.LineBasicMaterial({
-          color: highlight === true ? 0x2f8cff : highlight,
+          color:
+            highlight === true ? (this.preferences.palette === "okabe-ito" ? 0xe69f00 : 0x2f8cff) : highlight,
           transparent: true,
           opacity: 0.9,
           depthTest: false,
@@ -398,6 +598,20 @@ export class Viewport {
       outline.quaternion.copy(rotation);
       outline.userData = { ...tag };
       this.group.add(outline);
+      if (this.preferences.boldSelection) {
+        const vertices = outline.geometry.getAttribute("position");
+        for (let i = 0; i < vertices.count; i += 2) {
+          const a = new THREE.Vector3()
+            .fromBufferAttribute(vertices, i)
+            .applyQuaternion(rotation)
+            .add(position);
+          const b = new THREE.Vector3()
+            .fromBufferAttribute(vertices, i + 1)
+            .applyQuaternion(rotation)
+            .add(position);
+          this.line(a, b, outline.material.color.getHex(), 0.004, true);
+        }
+      }
     }
     return mesh;
   }
@@ -421,7 +635,26 @@ export class Viewport {
     mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), delta.normalize());
     this.group.add(mesh);
   }
-  show(
+  private pendingShow: Parameters<Viewport["build"]> | null = null;
+  /**
+   * Shows a design. The scene is rebuilt once, just before the next frame is drawn: one edit redraws
+   * several times (sync, dirty marking, selection), and only the last call is ever seen.
+   */
+  show(...args: Parameters<Viewport["build"]>) {
+    this.assemblyLabels.visible = false;
+    this.current = args[0];
+    this.selectedMember = args[3]?.startsWith("member:") ? args[3].slice("member:".length) : "";
+    this.pendingShow = args;
+  }
+  /** Rebuilds the scene now if a `show` is waiting, so picking and dragging see what is on screen. */
+  private flush() {
+    const args = this.pendingShow;
+    if (!args) return;
+    this.pendingShow = null;
+    this.build(...args);
+    this.scene.updateMatrixWorld();
+  }
+  private build(
     design: Design,
     displacement: number[] | null = null,
     scale = 1,
@@ -432,6 +665,8 @@ export class Viewport {
     this.current = design;
     this.selectedMember = selected.startsWith("member:") ? selected.slice("member:".length) : "";
     this.clear();
+    this.shapesUsed.clear();
+    const geometryKey = JSON.stringify(design.geometry);
     const points = new Map<string, THREE.Vector3>();
     design.nodes.forEach((node, i) => {
       const p = new THREE.Vector3(...node.position);
@@ -446,9 +681,15 @@ export class Viewport {
       const frame = memberFrame(a, b, member.roll);
       const length = a.distanceTo(b);
       const highlight =
-        selected === `member:${member.id}` ? true : member.id === this.winder ? 0xff5a36 : false;
+        selected === `member:${member.id}` || this.picked.has(member.id)
+          ? true
+          : member.id === this.winder
+            ? 0xff5a36
+            : false;
+      // Lengths that differ by less than 1 nm are drawn with one shape.
+      const size = `${geometryKey}|${member.kind}|${member.catalogId}|${member.holeCount}|${length.toFixed(9)}`;
       if (member.kind === "male")
-        for (const [i, g] of maleGeometry(length, design.geometry).entries())
+        for (const [i, g] of this.shape(size, () => maleGeometry(length, design.geometry)).entries())
           this.mesh(g, i === 0 ? 0xa47546 : 0x85623f, a, frame.quaternion, { member: member.id }, highlight);
       else {
         const shift = frame.z
@@ -457,23 +698,157 @@ export class Viewport {
             femaleLayerSign(design, member, frame.z) * (member.layer + 0.5) * design.geometry.thickness,
           );
         this.mesh(
-          femaleGeometry(length, design.geometry, member.holeCount, member),
-          0xd9bb85,
+          this.shape(size, () => [femaleGeometry(length, design.geometry, member.holeCount, member)])[0],
+          this.colorMode === "layer"
+            ? (layerColors(this.preferences.palette)[member.layer] ?? 0xd9bb85)
+            : 0xd9bb85,
           a.clone().add(shift),
           frame.quaternion,
           { member: member.id },
           highlight,
         );
+        if (this.preferences.layerLabels) {
+          const canvas = document.createElement("canvas");
+          canvas.width = canvas.height = 64;
+          const context = canvas.getContext("2d");
+          if (!context) throw new Error("段番号を描画できません");
+          context.fillStyle = "#111111";
+          context.fillRect(0, 0, 64, 64);
+          context.strokeStyle = "#ffffff";
+          context.lineWidth = 4;
+          context.strokeRect(2, 2, 60, 60);
+          context.fillStyle = "#ffffff";
+          context.font = "bold 44px sans-serif";
+          context.textAlign = "center";
+          context.fillText(String(member.layer + 1), 32, 48);
+          const label = new THREE.Sprite(
+            new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), depthTest: false }),
+          );
+          label.position.copy(a).lerp(b, 0.5).add(shift);
+          label.scale.setScalar(0.12);
+          label.renderOrder = 10;
+          this.group.add(label);
+        }
+      }
+    }
+    if (this.woodTexture) {
+      this.group.updateMatrixWorld(true);
+      const bounds = new THREE.Box3();
+      for (const mesh of this.targets) if (mesh.userData.member) bounds.expandByObject(mesh);
+      if (!bounds.isEmpty()) {
+        const center = bounds.getCenter(new THREE.Vector3());
+        const radius = Math.max(1, bounds.getSize(new THREE.Vector3()).length());
+        this.woodGround.position.y = bounds.min.y - 0.002;
+        this.woodKey.position.copy(center).add(new THREE.Vector3(0.7, 1.5, 1).multiplyScalar(radius));
+        this.woodKey.target.position.copy(center);
+        const camera = this.woodKey.shadow.camera;
+        camera.left = camera.bottom = -radius;
+        camera.right = camera.top = radius;
+        camera.near = 0.01;
+        camera.far = radius * 5;
+        camera.updateProjectionMatrix();
       }
     }
     if (this.engineering) {
-      const maximum = Math.max(1e-12, ...this.engineering.members.map((m) => m.normalMPa));
+      const maximum = Math.max(1e-12, this.engineering.stressScaleMPa);
       for (const target of this.targets) {
         const member = this.engineering.members.find((m) => m.id === target.userData.member);
-        if (member && target instanceof THREE.Mesh && target.material instanceof THREE.MeshStandardMaterial)
-          target.material.color.setHSL((1 - member.normalMPa / maximum) * 0.65, 0.85, 0.55);
+        if (member && target instanceof THREE.Mesh && target.material instanceof THREE.MeshStandardMaterial) {
+          const elements = this.engineering.elements.filter((e) => e.id === member.id);
+          const originalGeometry = target.geometry;
+          const geometry = originalGeometry.clone();
+          if (!originalGeometry.userData.shared) originalGeometry.dispose();
+          geometry.userData.shared = false;
+          const vertices = geometry.getAttribute("position"),
+            colors: number[] = [];
+          for (let i = 0; i < vertices.count; i++) {
+            const point = new THREE.Vector3()
+              .fromBufferAttribute(vertices, i)
+              .applyQuaternion(target.quaternion)
+              .add(target.position);
+            let nearest = Infinity,
+              value = 0;
+            for (const e of elements) {
+              const x = point
+                .clone()
+                .sub(new THREE.Vector3(...e.origin))
+                .dot(new THREE.Vector3(...e.basis[0]));
+              const outside = Math.max(0, -x, x - e.length);
+              if (outside > nearest) continue;
+              nearest = outside;
+              const index = Math.max(0, Math.min(40, Math.round((x / e.length) * 40)));
+              value = stressEnvelope(
+                e.samples[index],
+                this.engineering.material,
+                design.geometry.boardWidth,
+                design.geometry.thickness,
+              );
+            }
+            const color = new THREE.Color().setHSL((1 - Math.min(1, value / maximum)) * 0.65, 0.85, 0.55);
+            colors.push(color.r, color.g, color.b);
+          }
+          geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+          target.geometry = geometry;
+          target.material.vertexColors = true;
+          target.material.color.setHex(0xffffff);
+        }
       }
+      if (this.engineering.ground) {
+        const ground = this.engineering.ground;
+        for (const contact of ground.contacts) {
+          if (contact.force[1] <= 1e-6) continue;
+          const marker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.009, 8, 6),
+            new THREE.MeshBasicMaterial({
+              color: contact.state === "limit" ? 0xffa726 : 0x45d6a1,
+              depthTest: false,
+            }),
+          );
+          marker.position.set(...contact.point);
+          marker.renderOrder = 11;
+          this.group.add(marker);
+        }
+        const floor = new THREE.Mesh(
+          new THREE.PlaneGeometry(12, 12),
+          new THREE.MeshBasicMaterial({
+            color: 0x768b80,
+            transparent: true,
+            opacity: 0.12,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          }),
+        );
+        floor.rotation.x = -Math.PI / 2;
+        floor.position.y = (ground.floorY ?? 0) - 0.001;
+        this.group.add(floor);
+      }
+      const engineeringMaterial = this.engineering.material;
       for (const element of this.engineering.elements) {
+        const band = new THREE.BufferGeometry().setFromPoints(
+          element.samples.map((s) =>
+            new THREE.Vector3(...s.position).addScaledVector(
+              new THREE.Vector3(...element.basis[1]),
+              design.geometry.boardWidth * 0.6,
+            ),
+          ),
+        );
+        const colors = element.samples.flatMap((s) => {
+          const value = stressEnvelope(
+            s,
+            engineeringMaterial,
+            design.geometry.boardWidth,
+            design.geometry.thickness,
+          );
+          const c = new THREE.Color().setHSL((1 - Math.min(1, value / maximum)) * 0.65, 0.85, 0.55);
+          return [c.r, c.g, c.b];
+        });
+        band.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+        const strip = new THREE.Line(
+          band,
+          new THREE.LineBasicMaterial({ vertexColors: true, depthTest: false }),
+        );
+        strip.renderOrder = 12;
+        this.group.add(strip);
         const points = element.samples.map((s) =>
           new THREE.Vector3(...s.position).addScaledVector(new THREE.Vector3(...s.displacement), scale),
         );
@@ -539,9 +914,9 @@ export class Viewport {
         const mesh = new THREE.Mesh(
           geometry,
           new THREE.MeshStandardMaterial({
-            color: 0x3d9d86,
+            color: this.placementColor(!!this.preview.blocked),
             transparent: true,
-            opacity: 0.35,
+            opacity: this.preview.blocked ? 0.3 : 0.35,
             depthWrite: false,
           }),
         );
@@ -554,8 +929,9 @@ export class Viewport {
       const point = points.get(node.id);
       if (!point) continue;
       const anchor = this.anchors.has(node.id);
+      const radius = selected === node.id ? 0.045 : anchor ? 0.038 : 0.024;
       const mesh = new THREE.Mesh(
-        new THREE.SphereGeometry(selected === node.id ? 0.045 : anchor ? 0.038 : 0.024, 12, 8),
+        this.shape(`node|${radius}`, () => [new THREE.SphereGeometry(radius, 12, 8)])[0],
         new THREE.MeshStandardMaterial({
           color: selected === node.id ? 0xf1a043 : anchor ? 0x2fbf8f : node.fixed ? 0x275d4d : 0xeee6d0,
           transparent: true,
@@ -612,6 +988,19 @@ export class Viewport {
       lock.position.copy(fixedEnd);
       this.group.add(lock);
     }
+    if (this.axisGuide) {
+      const { axis, point } = this.axisGuide;
+      const along = new THREE.Vector3(...AXIS_GUIDE[axis].direction).multiplyScalar(AXIS_GUIDE_REACH);
+      const centre = new THREE.Vector3(...point);
+      const guide = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([centre.clone().sub(along), centre.clone().add(along)]),
+        new THREE.LineBasicMaterial({ color: AXIS_GUIDE[axis].color, depthTest: false }),
+      );
+      // On top of the parts, like Blender's constraint line, but never picked.
+      guide.renderOrder = 10;
+      guide.userData = { guide: axis };
+      this.group.add(guide);
+    }
     for (const ring of design.rings) {
       const host = design.members.find((m) => m.id === ring.member);
       if (!host) continue;
@@ -654,6 +1043,11 @@ export class Viewport {
       this.anchor.quaternion.copy(this.base);
       this.transform.attach(this.anchor);
     } else if (!this.transform.dragging) this.transform.detach();
+    for (const [key, shapes] of this.shapes)
+      if (!this.shapesUsed.has(key)) {
+        for (const g of shapes) g.dispose();
+        this.shapes.delete(key);
+      }
   }
   private frameOverlay(frame: RopeFrame, points: Map<string, THREE.Vector3>, selected: boolean) {
     const p = frame.nodes.map((id) => points.get(id));
@@ -726,5 +1120,108 @@ export class Viewport {
     this.controls.target.copy(center);
     this.camera.position.copy(center).add(new THREE.Vector3(0.7, 0.5, 1).multiplyScalar(distance));
     this.controls.update();
+  }
+  private assemblyParts: { object: THREE.Object3D; base: THREE.Vector3; index: number }[] = [];
+  private assemblyLabels = new THREE.Group();
+  private assemblyPlan: AssemblyPlan | null = null;
+  get canvas() {
+    return this.renderer.domElement;
+  }
+  setActive(active: boolean) {
+    this.renderer.setAnimationLoop(
+      active
+        ? () => {
+            this.flush();
+            this.controls.update();
+            this.applyEmphasis(performance.now());
+            this.renderer.render(this.scene, this.camera);
+          }
+        : null,
+    );
+  }
+  beginAssembly(plan: AssemblyPlan) {
+    this.flush();
+    this.assemblyPlan = plan;
+    this.assemblyParts = [];
+    this.assemblyLabels.traverse((o) => {
+      if (o instanceof THREE.Sprite) {
+        o.material.map?.dispose();
+        o.material.dispose();
+      }
+    });
+    this.assemblyLabels.clear();
+    this.assemblyLabels.visible = true;
+    this.scene.add(this.assemblyLabels);
+    const numberFor = new Map(plan.steps.map((s, i) => [s.id, i]));
+    const bounds = new Map<string, THREE.Box3>();
+    for (const object of this.group.children) {
+      const id =
+        object.userData.member ?? (object.userData.ring ? `ring:${object.userData.ring}` : undefined);
+      const index = id === undefined ? undefined : numberFor.get(id);
+      object.visible = index !== undefined;
+      if (index === undefined) continue;
+      this.assemblyParts.push({ object, base: object.position.clone(), index });
+      const box = bounds.get(id) ?? new THREE.Box3();
+      box.expandByObject(object);
+      bounds.set(id, box);
+    }
+    for (const [id, box] of bounds) {
+      const index = numberFor.get(id);
+      if (index === undefined) continue;
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 128;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) throw new Error("部材番号を描画できません");
+      ctx.fillStyle = "#162c3c";
+      ctx.beginPath();
+      ctx.arc(64, 64, 55, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = "#f7bd64";
+      ctx.lineWidth = 6;
+      ctx.stroke();
+      ctx.fillStyle = "white";
+      ctx.font = "bold 64px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(index + 1), 64, 67);
+      const label = new THREE.Sprite(
+        new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), depthTest: false }),
+      );
+      label.position.copy(box.getCenter(new THREE.Vector3()));
+      label.position.y += 0.1;
+      const extent = this.current
+        ? new THREE.Box3()
+            .setFromPoints(this.current.nodes.map((n) => new THREE.Vector3(...n.position)))
+            .getSize(new THREE.Vector3())
+            .length()
+        : 1;
+      const size = Math.max(0.12, extent * 0.022);
+      label.scale.set(size, size, 1);
+      label.renderOrder = 20;
+      this.assemblyLabels.add(label);
+      this.assemblyParts.push({ object: label, base: label.position.clone(), index });
+    }
+    this.showAssembly(plan.steps.length);
+  }
+  showAssembly(progress: number) {
+    const plan = this.assemblyPlan;
+    if (!plan) return;
+    const current = Math.floor(progress),
+      fraction = progress - current;
+    const supportIds = new Set([
+      ...(plan.steps[Math.min(current, plan.steps.length) - 1]?.supportIds ?? []),
+      ...(fraction > 0 ? (plan.steps[current]?.supportIds ?? []) : []),
+    ]);
+    for (const p of this.assemblyParts) {
+      if (p.object instanceof THREE.Sprite)
+        p.object.material.color.set(supportIds.has(plan.steps[p.index].id) ? 0xffa43a : 0xffffff);
+      p.object.visible = p.index < current || (p.index === current && fraction > 0);
+      p.object.position.copy(p.base);
+      if (p.index === current)
+        p.object.position.addScaledVector(
+          new THREE.Vector3(...plan.steps[p.index].approach),
+          1 - fraction * fraction * (3 - 2 * fraction),
+        );
+    }
   }
 }

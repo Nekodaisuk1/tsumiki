@@ -26,3 +26,7 @@ Status: Draft / Ready / In progress / Verified / Rejected / Integrated
 
 ## Current priority
 荷重や揺れに耐えるための補強が主目的。次の試作は007の3D荷重・揺れ比較を優先する。006は接合部の遊びや歪み是正の局所的な検証として位置付け直す。3D静的応答を先に検証し、動的応答へ進む。
+
+- [011: Floor contact and friction](011-floor-contact.md)
+- [012: Assembly planning and video](012-assembly-planning.md)
+- [013: Stress distribution and local FEM specimens](013-stress-distribution.md)
