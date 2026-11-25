@@ -3,6 +3,7 @@ import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { type Design, validateDesign } from "./design";
 import { femaleGeometry, femaleLayerSign, maleGeometry, memberFrame, ringGeometry } from "./geometry";
 import { ropeAttachments } from "./rope";
+import { applyWoodTexture, createWoodTexture, type WoodTextures } from "./wood-texture";
 
 /** Export the committed, undeformed model without viewport decorations or previews. */
 export function createExportScene(design: Design) {
@@ -87,13 +88,28 @@ export function createExportScene(design: Design) {
   scene.updateMatrixWorld(true);
   return scene;
 }
-export async function exportDesignGlb(design: Design): Promise<ArrayBuffer> {
+export async function exportDesignGlb(design: Design, textured = false): Promise<ArrayBuffer> {
   const scene = createExportScene(design);
+  let texture: WoodTextures | null = null;
   try {
+    if (textured) {
+      texture = createWoodTexture();
+      scene.traverse((object) => {
+        if (object instanceof THREE.Mesh && !object.parent?.userData.ropeId) {
+          applyWoodTexture(
+            object.geometry,
+            object.material,
+            texture as WoodTextures,
+            object.parent?.userData.memberId ?? object.userData.ringId ?? object.name,
+          );
+        }
+      });
+    }
     const data = await new GLTFExporter().parseAsync(scene, { binary: true });
     if (!(data instanceof ArrayBuffer)) throw new Error("GLB出力を生成できませんでした");
     return data;
   } finally {
+    texture?.dispose();
     const materials = new Set<THREE.Material>();
     scene.traverse((object) => {
       if (object instanceof THREE.Mesh) {
