@@ -1,8 +1,15 @@
 import { expect, it } from "vitest";
+import { catalogPart } from "../src/structure/catalog";
 import { createDesign, parseDesign, serializeDesign } from "../src/structure/design";
-import { insertMaleAtHole } from "../src/structure/editor";
+import {
+  connectThreadedMales,
+  createDrawingDesign,
+  insertMaleAtHole,
+  shareTenonEnds,
+} from "../src/structure/editor";
 import { dot3, holeSite, insertionPreview, sub3, unit3 } from "../src/structure/holes";
 import { solveStatic } from "../src/structure/solver";
+import { addTemplate } from "../src/structure/templates";
 
 it("starts with packed female boards without an unexplained thickness gap", () => {
   const d = createDesign();
@@ -73,4 +80,38 @@ it("connects every pierced parallel board automatically", () => {
   const result = insertMaleAtHole(d, "m4", 3, 1, 1);
   expect(result.connected).toBe(2);
   expect(() => serializeDesign(d)).not.toThrow();
+});
+
+it("puts a board joined at its end hole onto the male's tip node it was left beside", () => {
+  const d = createDrawingDesign();
+  const { memberId } = insertMaleAtHole(d, "m0", 0, catalogPart("male-600").span, 1);
+  addTemplate(d, {
+    shape: "square",
+    males: [memberId],
+    direction: "x",
+    size: catalogPart("female-1200-square").span,
+  });
+  connectThreadedMales(d);
+  const board = d.members.find((m) => m.id === "m4");
+  const male = d.members.find((m) => m.id === "m2");
+  if (!board || !male) throw new Error("Missing bay parts");
+  expect(d.connections).toContainEqual(
+    expect.objectContaining({ male: "m2", female: "m4", hole: board.holeCount - 1 }),
+  );
+  // As a mirror can leave it: the joint is recorded, but the board ends on a node of its own 1 µm away.
+  const tip = d.nodes.find((n) => n.id === board.end);
+  if (!tip) throw new Error("Missing tip");
+  d.nodes.push({
+    id: "loose",
+    position: [tip.position[0] + 1e-6, tip.position[1], tip.position[2]],
+    fixed: false,
+  });
+  board.end = "loose";
+  const before = parseDesign(serializeDesign(d));
+  expect(before.nodes.some((n) => n.id === "loose")).toBe(true);
+  expect(shareTenonEnds(d)).toEqual(["m4"]);
+  expect(board.end).toBe(male.end);
+  expect(d.nodes.some((n) => n.id === "loose")).toBe(false);
+  expect(parseDesign(serializeDesign(d)).members.find((m) => m.id === "m4")?.end).toBe(male.end);
+  expect(shareTenonEnds(d)).toEqual([]);
 });

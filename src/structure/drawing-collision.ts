@@ -48,8 +48,39 @@ function localCells(design: Design, member: Member, length: number): Vector3[][]
   cache.set(key, cells);
   return cells;
 }
-function cells(design: Design, member: Member): Cell[] {
+/** Where a member's solid lies: its frame, plus a key that is equal exactly when the solid is the same. */
+export type DrawingSolid = { key: string; cells: () => Cell[] };
+export function drawingSolid(design: Design, member: Member): DrawingSolid {
   const frame = boardAxes(design, member);
+  const { kind, catalogId, holeCount, layer, roll } = member;
+  const key = JSON.stringify([kind, catalogId, holeCount, layer, roll, frame.start, frame.end, frame.normal]);
+  const full = `${geometryKey(design)}${key}`;
+  return {
+    key: full,
+    cells: () => {
+      let built = placed.get(full);
+      if (!built) {
+        built = cells(design, member, frame);
+        if (placed.size >= PLACED_CACHE) placed.clear();
+        placed.set(full, built);
+      }
+      return built;
+    },
+  };
+}
+/** Placed solids by key, reused by later checks (and floor supports) while the member stays put. */
+const placed = new Map<string, Cell[]>();
+const PLACED_CACHE = 4000;
+const geometryKeys = new WeakMap<object, string>();
+function geometryKey(design: Design) {
+  let key = geometryKeys.get(design.geometry);
+  if (key === undefined) {
+    key = JSON.stringify(design.geometry);
+    geometryKeys.set(design.geometry, key);
+  }
+  return key;
+}
+function cells(design: Design, member: Member, frame: ReturnType<typeof boardAxes>): Cell[] {
   const start = new Vector3(...frame.start);
   const rotation = memberFrame(start, new Vector3(...frame.end), member.roll).quaternion;
   if (member.kind === "female")
@@ -80,13 +111,36 @@ function overlap(a: Cell, b: Cell): boolean {
   for (const ea of a.edges) for (const eb of b.edges) if (separates(ea.clone().cross(eb))) return false;
   return true;
 }
-/** Narrow phase for the same polygonal circular holes and rounded outlines used by the renderer. */
 /** Corner points of the drawing solid of a member (the same outline the renderer and collisions use). */
 export function memberSolidPoints(design: Design, member: Member): Vector3[] {
-  return cells(design, member).flatMap((cell) => cell.points);
+  return drawingSolid(design, member)
+    .cells()
+    .flatMap((cell) => cell.points);
+}
+/**
+ * Results for pairs of solids already compared. Editing re-validates the whole design several times per
+ * step while most pairs stay where they were, so only pairs with a moved or changed member are compared.
+ */
+const pairs = new Map<string, boolean>();
+const PAIR_CACHE = 50_000;
+/** Narrow phase for the same polygonal circular holes and rounded outlines used by the renderer. */
+export function drawingSolidsOverlap(a: DrawingSolid, b: DrawingSolid): boolean {
+  const key = a.key < b.key ? `${a.key}|${b.key}` : `${b.key}|${a.key}`;
+  const known = pairs.get(key);
+  if (known !== undefined) return known;
+  const ac = a.cells();
+  const bc = b.cells();
+  // Only cells reaching into the other solid's box can touch it.
+  const around = (list: Cell[]) => list.reduce((box, c) => box.union(c.bounds), new Box3());
+  const aBox = around(ac);
+  const bBox = around(bc);
+  const near = (list: Cell[], box: Box3) => list.filter((c) => c.bounds.intersectsBox(box));
+  const bNear = near(bc, aBox);
+  const result = bNear.length > 0 && near(ac, bBox).some((x) => bNear.some((y) => overlap(x, y)));
+  if (pairs.size >= PAIR_CACHE) pairs.clear();
+  pairs.set(key, result);
+  return result;
 }
 export function drawingMembersOverlap(design: Design, a: Member, b: Member): boolean {
-  const ac = cells(design, a);
-  const bc = cells(design, b);
-  return ac.some((x) => bc.some((y) => overlap(x, y)));
+  return drawingSolidsOverlap(drawingSolid(design, a), drawingSolid(design, b));
 }

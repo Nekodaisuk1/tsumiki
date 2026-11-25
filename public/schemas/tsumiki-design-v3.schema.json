@@ -76,8 +76,7 @@
           }
         }
       },
-      "minItems": 2,
-      "maxItems": 32
+      "minItems": 2
     },
     "members": {
       "type": "array",

@@ -2,7 +2,7 @@ import { Matrix3, Vector3 } from "three";
 import { OBB } from "three/addons/math/OBB.js";
 import { femaleMargin, holeOffsets } from "./catalog";
 import type { Design, Member, Vec3 } from "./design";
-import { drawingMembersOverlap } from "./drawing-collision";
+import { drawingSolid, drawingSolidsOverlap } from "./drawing-collision";
 import { add3, boardAxes, cross3, dot3, holeSite, scale3, sub3 } from "./holes";
 
 // Positive-volume overlap only: touching faces are valid assembly contacts.
@@ -90,18 +90,66 @@ function threadedTenons(design: Design, male: Member, female: Member): Set<Part>
   return threaded;
 }
 
+/**
+ * Whether two males point a tenon each at the other along one line, close enough for the tenons to meet
+ * (as when both are pushed into one hole from its two faces).
+ */
+function facingTenons(design: Design, a: Member, b: Member): boolean {
+  if (a.kind !== "male" || b.kind !== "male") return false;
+  const { tenonLength, tenonSize } = design.geometry;
+  const at = (id: string) => design.nodes.find((n) => n.id === id)?.position;
+  const tips = (m: Member) =>
+    [
+      [m.start, m.end],
+      [m.end, m.start],
+    ].flatMap(([tip, base]) => {
+      const p = at(tip);
+      const q = at(base);
+      if (!p || !q) return [];
+      const shaft = sub3(p, q);
+      return [{ tip: p, out: scale3(shaft, 1 / Math.hypot(...shaft)) }];
+    });
+  return tips(a).some((x) =>
+    tips(b).some((y) => {
+      if (dot3(x.out, y.out) > -(1 - 1e-6)) return false;
+      const gap = sub3(y.tip, x.tip);
+      const along = dot3(gap, x.out);
+      const across = Math.hypot(...sub3(gap, scale3(x.out, along)));
+      return along > -1e-6 && along < 2 * tenonLength && across < tenonSize;
+    }),
+  );
+}
+/** Axis-aligned bounds of a member's boxes, per axis as [min, max]. */
+function boundsOf(boxes: Box[]) {
+  return [0, 1, 2].map((axis) => {
+    const ranges = boxes.map((box) => {
+      const radius = box.axes.reduce((sum, v, i) => sum + Math.abs(v[axis]) * box.half[i], 0);
+      return [box.center[axis] - radius, box.center[axis] + radius];
+    });
+    return [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))];
+  });
+}
+/** Broad-phase bounds of drawing parts by their placed-solid key. */
+const knownBounds = new Map<string, number[][]>();
+const BOUNDS_CACHE = 4000;
 /** Throws on the first pair of members that overlap. With `only`, pairs not involving those members are skipped. */
 export function validateMemberCollisions(design: Design, only?: ReadonlySet<string>): void {
+  const drawing = design.version === 6;
   const solids = design.members.map((member) => {
-    const boxes = memberBoxes(design, member);
-    const bounds = [0, 1, 2].map((axis) => {
-      const ranges = boxes.map((box) => {
-        const radius = box.axes.reduce((sum, v, i) => sum + Math.abs(v[axis]) * box.half[i], 0);
-        return [box.center[axis] - radius, box.center[axis] + radius];
-      });
-      return [Math.min(...ranges.map((r) => r[0])), Math.max(...ranges.map((r) => r[1]))];
-    });
-    return { member, boxes, bounds };
+    if (!drawing) {
+      const boxes = memberBoxes(design, member);
+      return { member, boxes, bounds: boundsOf(boxes), drawn: undefined };
+    }
+    // Drawing parts only use the boxes for the broad phase; their bounds are kept while the part stays
+    // put, so a check after a small edit (or each step of a hinge sweep) does not rebuild every box.
+    const drawn = drawingSolid(design, member);
+    let bounds = knownBounds.get(drawn.key);
+    if (!bounds) {
+      bounds = boundsOf(memberBoxes(design, member));
+      if (knownBounds.size >= BOUNDS_CACHE) knownBounds.clear();
+      knownBounds.set(drawn.key, bounds);
+    }
+    return { member, boxes: [] as Box[], bounds, drawn };
   });
   for (let i = 0; i < solids.length; i++) {
     for (let j = i + 1; j < solids.length; j++) {
@@ -116,9 +164,11 @@ export function validateMemberCollisions(design: Design, only?: ReadonlySet<stri
       )
         continue;
       if (design.version === 6) {
-        if (drawingMembersOverlap(design, a.member, b.member))
+        if (a.drawn && b.drawn && drawingSolidsOverlap(a.drawn, b.drawn))
           throw new Error(
-            `部材 ${a.member.id} と ${b.member.id} が干渉しています。位置・向き・重ね段を変更してください`,
+            facingTenons(design, a.member, b.member)
+              ? `雄材 ${a.member.id} と ${b.member.id} の凸の先同士がぶつかります。1つの穴に両側から凸は差せないので、ずらす量か穴を変えてください`
+              : `部材 ${a.member.id} と ${b.member.id} が干渉しています。位置・向き・重ね段を変更してください`,
           );
         continue;
       }

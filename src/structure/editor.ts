@@ -1,6 +1,14 @@
 import { type CatalogPart, catalogPart, HITOTO_GEOMETRY, HITOTO_PARTS } from "./catalog";
 import { validateMemberCollisions } from "./collision";
-import { createDesign, type Design, type Member, parseDesign, serializeDesign, type Vec3 } from "./design";
+import {
+  createDesign,
+  type Design,
+  formatDesign,
+  type Member,
+  parseDesign,
+  serializeDesign,
+  type Vec3,
+} from "./design";
 import {
   boardAxes,
   dot3,
@@ -14,18 +22,24 @@ import {
 import { freeLayers, nextOuterLayer } from "./seats";
 import { rollFacing } from "./templates";
 export function nextId(design: Design, prefix: string) {
-  const ids = new Set(
-    [
-      ...design.nodes,
-      ...design.members,
-      ...design.ropes,
-      ...design.rings,
-      ...design.materials,
-      ...design.connections,
-    ].map((v) => v.id),
-  );
+  // The lowest free number for the prefix. Only the numbers are collected: this runs once per new
+  // joint while a big design is re-matched, so building every id string was a large part of an edit.
+  const taken = new Set<number>();
+  for (const list of [
+    design.nodes,
+    design.members,
+    design.ropes,
+    design.rings,
+    design.materials,
+    design.connections,
+  ])
+    for (const { id } of list)
+      if (id.startsWith(prefix)) {
+        const rest = id.slice(prefix.length);
+        if (/^(0|[1-9]\d*)$/.test(rest)) taken.add(Number(rest));
+      }
   let n = 0;
-  while (ids.has(`${prefix}${n}`)) n++;
+  while (taken.has(n)) n++;
   return `${prefix}${n}`;
 }
 export function appendMember(
@@ -90,14 +104,24 @@ export function boardRoll(design: Design, startId: string, endId: string) {
  * fits in: a seat free in the bookkeeping can still be blocked by a long neighbouring board lying in the
  * same plane. Records the tenon holes it is stacked on. The board's own `layer` is ignored.
  */
-export function placeBoard(design: Design, board: Member) {
+/**
+ * Adds a board on the innermost free layer that does not collide. `through` are further tenon nodes the
+ * board's middle holes sit on (besides its own end nodes); their layers and hole joints count as well.
+ */
+export function placeBoard(design: Design, board: Member, prefer?: number, through: string[] = []) {
   let collision: unknown;
-  for (const layer of freeLayers(design, [board.start, board.end])) {
+  const tenons = [board.start, board.end, ...through];
+  const free = freeLayers(design, tenons);
+  // A preferred layer (e.g. the layer of the board being copied) is tried first when it is free.
+  const order =
+    prefer !== undefined && free.includes(prefer) ? [prefer, ...free.filter((l) => l !== prefer)] : free;
+  for (const layer of order) {
     const joints = design.connections.length;
     design.members.push({ ...board, layer });
-    recordTenonHoles(design, board.id, [board.start, board.end]);
+    recordTenonHoles(design, board.id, tenons);
     try {
-      validateMemberCollisions(design);
+      // Only the board just placed can have made something collide.
+      validateMemberCollisions(design, new Set([board.id]));
       return layer;
     } catch (error) {
       collision = error;
@@ -420,6 +444,13 @@ export function extendBay(design: Design, depth: number) {
     });
 }
 export class DesignHistory {
+  private limit = 80;
+  setLimit(limit: number) {
+    if (![20, 80, 200].includes(limit)) throw new Error("Invalid undo limit");
+    this.limit = limit;
+    this.undoList = this.undoList.slice(-limit);
+    this.redoList = this.redoList.slice(-limit);
+  }
   private undoList: string[] = [];
   private redoList: string[] = [];
   get canUndo() {
@@ -428,11 +459,12 @@ export class DesignHistory {
   get canRedo() {
     return this.redoList.length > 0;
   }
+  /** Both designs must be valid ones (from `parseDesign` or `validCopy`); they are not checked again. */
   push(before: Design, after: Design) {
-    const value = serializeDesign(before);
-    if (value === serializeDesign(after)) return;
+    const value = formatDesign(before);
+    if (value === formatDesign(after)) return;
     this.undoList.push(value);
-    if (this.undoList.length > 80) this.undoList.shift();
+    if (this.undoList.length > this.limit) this.undoList.shift();
     this.redoList = [];
   }
   undo(current: Design): Design {
@@ -440,7 +472,7 @@ export class DesignHistory {
     if (!value) throw new Error("元に戻せる操作がありません");
     const restored = parseDesign(value);
     this.undoList.pop();
-    this.redoList.push(serializeDesign(current));
+    this.redoList.push(formatDesign(current));
     return restored;
   }
   redo(current: Design): Design {
@@ -448,7 +480,7 @@ export class DesignHistory {
     if (!value) throw new Error("やり直せる操作がありません");
     const restored = parseDesign(value);
     this.redoList.pop();
-    this.undoList.push(serializeDesign(current));
+    this.undoList.push(formatDesign(current));
     return restored;
   }
 }
@@ -604,6 +636,40 @@ export function createDrawingDesign(catalogId = "female-2400-square"): Design {
   return parseDesign(serializeDesign(design));
 }
 
+/** How far apart (0.1 mm) a board's end node and the tip of the male in that end hole may be to be one. */
+const SHARED_TIP = 1e-4;
+/**
+ * Puts a board whose end hole is joined to a male's tip onto that tip node. Mirrored or copied parts can
+ * leave the board on a node of its own a few micrometres away; the joint is recorded, but the board's end
+ * stays on that loose node, so the analysis frame left it hanging free. Nodes left unused are removed.
+ * Returns the boards moved onto a tip.
+ */
+export function shareTenonEnds(design: Design): string[] {
+  const moved: string[] = [];
+  const position = (id: string) => design.nodes.find((n) => n.id === id)?.position;
+  for (const c of design.connections) {
+    const board = design.members.find((m) => m.id === c.female && m.kind === "female");
+    const male = design.members.find((m) => m.id === c.male && m.kind === "male");
+    if (!board || !male) continue;
+    const end = c.hole === 0 ? "start" : c.hole === board.holeCount - 1 ? "end" : null;
+    const tip = male[c.end];
+    if (!end || board[end] === tip) continue;
+    const a = position(board[end]);
+    const b = position(tip);
+    if (!a || !b || Math.hypot(...sub3(a, b)) > SHARED_TIP) continue;
+    board[end] = tip;
+    moved.push(board.id);
+  }
+  if (moved.length) {
+    const used = new Set([
+      ...design.members.flatMap((m) => [m.start, m.end]),
+      ...design.ropes.flatMap((r) => r.route),
+      design.analysis.loadNode,
+    ]);
+    design.nodes = design.nodes.filter((n) => used.has(n.id));
+  }
+  return moved;
+}
 /**
  * Connects males whose tenons pass through a hole of a board they do not share a node with, e.g. a male
  * through the crossing of two braces whose recorded connection was lost in an earlier edit. Such a male

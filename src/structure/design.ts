@@ -207,6 +207,11 @@ function keys(value: Record<string, unknown>, expected: string[], context: strin
   if (Object.keys(value).some((key) => !expected.includes(key)) || expected.some((key) => !(key in value)))
     throw new Error(`${context}: 項目の不足または未対応の項目があります`);
 }
+/**
+ * How far (10 µm) a drawing part's node-to-node length may stray from its catalogue span. Moves and copies
+ * round node positions to 1 µm, which shifts both ends of a slanted part and its length by up to √3 µm.
+ */
+const SPAN_TOLERANCE = 1e-5;
 function number(value: unknown, min: number, max: number, context: string) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max)
     throw new Error(`${context}: ${min}〜${max}の有限数が必要です`);
@@ -263,17 +268,14 @@ export function validateDesign(value: unknown): asserts value is Design {
     d.notes.length > 10000
   )
     throw new Error("名称またはメモが不正です");
+  // Lists have no upper limit: large structures (e.g. a mirrored arch) need many nodes, members and hole
+  // joints. Analysis time still grows quickly with the size.
   for (const key of ["nodes", "members", "materials", "ropes", "rings", "connections"]) {
-    if (!Array.isArray(d[key]) || d[key].length > 100) throw new Error(`${key}: 配列または件数が不正です`);
+    if (!Array.isArray(d[key])) throw new Error(`${key}: 配列が不正です`);
   }
   const design = d as unknown as Design;
-  if (
-    design.nodes.length < 2 ||
-    design.nodes.length > 32 ||
-    design.members.length < 1 ||
-    design.materials.length < 1
-  )
-    throw new Error("節点は2〜32、部材・材料は1件以上必要です");
+  if (design.nodes.length < 2 || design.members.length < 1 || design.materials.length < 1)
+    throw new Error("節点は2件以上、部材・材料は1件以上必要です");
   const geometry = object(d.geometry, "geometry");
   keys(
     geometry,
@@ -382,7 +384,7 @@ export function validateDesign(value: unknown): asserts value is Design {
       const part = catalogPart(m.catalogId);
       if (
         m.kind !== part.kind ||
-        Math.abs(Math.hypot(...a.position.map((v, i) => v - b.position[i])) - part.span) > 1e-6 ||
+        Math.abs(Math.hypot(...a.position.map((v, i) => v - b.position[i])) - part.span) > SPAN_TOLERANCE ||
         m.holeCount !== (part.kind === "female" ? part.holes.length : 2)
       )
         throw new Error(`図面規格 ${part.label} の長さ・穴数・種類を維持してください`);
@@ -536,7 +538,18 @@ export function validateDesign(value: unknown): asserts value is Design {
 }
 export function serializeDesign(design: Design): string {
   validateDesign(design);
+  return formatDesign(design);
+}
+/** The saved text of a design already known to be valid (one returned by `parseDesign` or `validCopy`). */
+export function formatDesign(design: Design): string {
   return `${JSON.stringify(design, null, 2)}\n`;
+}
+/**
+ * A validated copy of a design as it would be saved and read back (`parseDesign(serializeDesign(d))`),
+ * checked once instead of twice: validation, with its collision test, is the slow part of an edit.
+ */
+export function validCopy(design: Design): Design {
+  return parseDesign(JSON.stringify(design));
 }
 export function migrateDesignV1(value: unknown): unknown {
   const old = object(value, "design");

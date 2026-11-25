@@ -3,7 +3,8 @@ import { createDesign, serializeDesign } from "../src/structure/design.ts";
 const id = { type: "string", pattern: "^[a-zA-Z][\\w-]{0,39}$" };
 const num = (minimum, maximum) => ({ type: "number", minimum, maximum });
 const obj = properties => ({ type: "object", additionalProperties: false, required: Object.keys(properties), properties });
-const list = (items, minItems = 0, maxItems = 100) => ({ type: "array", items, minItems, maxItems });
+const list = (items, minItems = 0, maxItems = 100) =>
+  maxItems === null ? { type: "array", items, minItems } : { type: "array", items, minItems, maxItems };
 const fixed = value => ({ const: value });
 const schema = {
   $schema: "https://json-schema.org/draft/2020-12/schema",
@@ -15,7 +16,7 @@ const schema = {
     name: { type: "string", maxLength: 200 }, notes: { type: "string", maxLength: 10000 }, jointModel: { enum: ["rigid-approximation", "clearance-contact"] },
     joint: obj({ contactStiffness: num(1e-3, 1e7), openStiffness: num(1e-6, 1e7) }),
     ropeWrap: { enum: ["sliding", "locked"] },
-    nodes: list(obj({ id, position: { type: "array", items: num(-20,20), minItems:3, maxItems:3 }, fixed: { type: "boolean" } }),2,32),
+    nodes: list(obj({ id, position: { type: "array", items: num(-20,20), minItems:3, maxItems:3 }, fixed: { type: "boolean" } }),2,null),
     members: list(obj({id,kind:{enum:["male","female"]},start:id,end:id,material:id,roll:num(-180,180),layer:{type:"integer",minimum:0,maximum:3},holeCount:{type:"integer",minimum:2,maximum:32}}),1),
     materials: list(obj({id,E:num(1e-8,1e7),G:num(1e-8,1e7),A:num(1e-8,1e7),Iy:num(1e-8,1e7),Iz:num(1e-8,1e7),J:num(1e-8,1e7),density:num(1e-8,1e7)}),1),
     ropes: list(obj({id,route:{type:"array",items:id,minItems:4,maxItems:4,uniqueItems:true},stiffness:num(0.01,1e5),prestrain:num(0,0.02),slack:num(0,0.2),windingMember:id})),

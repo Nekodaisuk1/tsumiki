@@ -10,9 +10,22 @@ export const cross3 = (a: Vec3, b: Vec3): Vec3 => [
   a[0] * b[1] - a[1] * b[0],
 ];
 export const unit3 = (a: Vec3) => scale3(a, 1 / Math.hypot(...a));
+/** Where each node id sits in its design's node list, kept per list and rebuilt when it goes stale. */
+const nodeIndex = new WeakMap<Design["nodes"], Map<string, number>>();
+/** The node with this id; the same as `design.nodes.find((n) => n.id === id)`, without the scan. */
+export function nodeById(design: Design, id: string) {
+  const at = nodeIndex.get(design.nodes)?.get(id);
+  const node = at === undefined ? undefined : design.nodes[at];
+  if (node?.id === id) return node;
+  // Missing or moved (nodes were added, removed or reordered since): index the list again.
+  const index = new Map(design.nodes.map((n, i) => [n.id, i]));
+  nodeIndex.set(design.nodes, index);
+  const i = index.get(id);
+  return i === undefined ? undefined : design.nodes[i];
+}
 export function boardAxes(design: Design, member: Member) {
-  const start = design.nodes.find((n) => n.id === member.start);
-  const end = design.nodes.find((n) => n.id === member.end);
+  const start = nodeById(design, member.start);
+  const end = nodeById(design, member.end);
   if (!start || !end) throw new Error("部材の節点がありません");
   const x = unit3(sub3(end.position, start.position));
   const y = unit3(cross3(Math.abs(x[2]) < 0.9 ? [0, 0, 1] : [0, 1, 0], x));
@@ -24,7 +37,7 @@ export function boardAxes(design: Design, member: Member) {
   );
   let sign = 1;
   if (host) {
-    const other = design.nodes.find((n) => n.id === (host.start === member.start ? host.end : host.start));
+    const other = nodeById(design, host.start === member.start ? host.end : host.start);
     if (other && dot3(normal, sub3(start.position, other.position)) < 0) sign = -1;
   }
   return {
@@ -62,16 +75,34 @@ export function holeOccupied(design: Design, female: string, hole: number, ignor
     )
   );
 }
+/** Whether `p` lies in the box around the segment from `a` to `b` grown by `reach` (a cheap superset). */
+function nearSegment(p: Vec3, a: Vec3, b: Vec3, reach: number) {
+  for (let i = 0; i < 3; i++)
+    if (p[i] < Math.min(a[i], b[i]) - reach || p[i] > Math.max(a[i], b[i]) + reach) return false;
+  return true;
+}
 export function matchingShaftHoles(design: Design, start: Vec3, end: Vec3, ignoreMale?: string) {
   const direction = unit3(sub3(end, start));
   const length = Math.hypot(...sub3(end, start));
   const t = design.geometry.thickness;
   const result: { female: string; hole: number; end: "start" | "end"; seat: number }[] = [];
+  const positions = new Map(design.nodes.map((n) => [n.id, n.position]));
+  const g = design.geometry;
   for (const member of design.members.filter((m) => m.kind === "female")) {
+    // A tenon reaches a board only near one of the shaft's ends; skip boards farther away than the tenon
+    // plus the board's half width, end margin and seat offset before working out its holes.
+    const a = positions.get(member.start);
+    const b = positions.get(member.end);
+    const reach = g.tenonLength + g.boardWidth + 5 * t + femaleMargin(g, member) + 1e-6;
+    if (a && b && !nearSegment(start, a, b, reach) && !nearSegment(end, a, b, reach)) continue;
     const axes = boardAxes(design, member);
     const denominator = dot3(axes.normal, direction);
     if (Math.abs(denominator) < 1e-8) continue;
-    const plane = holeSite(design, member.id, 0).position;
+    // Hole sites as `holeSite` gives them, from the axes already at hand.
+    const offsets = holeOffsets(axes.length, member.holeCount, member);
+    const seated = scale3(axes.normal, (member.layer + 0.5) * t);
+    const siteAt = (hole: number) => add3(add3(axes.start, scale3(axes.x, offsets[hole])), seated);
+    const plane = siteAt(0);
     const distance = dot3(axes.normal, sub3(plane, start)) / denominator;
     if (
       !(
@@ -91,13 +122,12 @@ export function matchingShaftHoles(design: Design, start: Vec3, end: Vec3, ignor
     )
       continue;
     if (Math.abs(denominator) < 1 - 1e-6) throw new Error("雄材は雌材の面に垂直に差し込んでください");
-    const offsets = holeOffsets(axes.length, member.holeCount, member);
     const hole = offsets.reduce(
       (best, value, i) => (Math.abs(value - along) < Math.abs(offsets[best] - along) ? i : best),
       0,
     );
     if (hole < 0 || hole >= member.holeCount) throw new Error("シャフトが雌材の穴のない部分に当たります");
-    const site = holeSite(design, member.id, hole);
+    const site = { position: siteAt(hole) };
     const clearance =
       design.version === 6
         ? design.geometry.holeSize / 2 - tenonOuterRadius(design.geometry)

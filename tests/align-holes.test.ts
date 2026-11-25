@@ -49,6 +49,23 @@ describe("turning a board to lay one hole over another", () => {
     expect(() => alignHole(d, { female: a, hole: 3 }, { female: a, hole: 4 })).toThrow("別の雌材");
   });
 
+  it("keeps the turned board square to a male that leans by rounding noise", () => {
+    const { d, a, b } = twoBoards();
+    // Some edits round node coordinates to 1e-6 and others do not, so a male can lean by about that much.
+    const board = d.members.find((m) => m.id === a);
+    const male = d.members.find((m) => m.kind === "male" && m.end === board?.start);
+    const foot = d.nodes.find((n) => n.id === male?.start);
+    if (!foot) throw new Error("fixture");
+    foot.position[0] += 5e-7;
+    alignHole(d, { female: b, hole: 3 }, { female: a, hole: 5 });
+    const after = valid(d);
+    const [p, q] = [holeSite(after, a, 5), holeSite(after, b, 3)];
+    const gap = p.position.map((v, i) => v - q.position[i]);
+    const along = Math.abs(gap.reduce((s, v, i) => s + v * q.normal[i], 0));
+    // One layer apart exactly; a leaning turn would put the far end micrometres off its seat.
+    expect(Math.abs(along - after.geometry.thickness)).toBeLessThan(1e-9);
+  });
+
   it("refuses a board with nothing to turn about", () => {
     const { d, b } = twoBoards();
     expect(() => alignHole(d, { female: b, hole: 3 }, { female: "m0", hole: 0 })).toThrow("回せません");

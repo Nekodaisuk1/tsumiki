@@ -1,4 +1,4 @@
-import type { Design, Rope, Vec3 } from "./design";
+import type { Design, Member, Rope, Vec3 } from "./design";
 import { ASSEMBLY_SLOTS } from "./seats";
 export type RopeFrame = {
   id: string;
@@ -42,18 +42,25 @@ export function ropeAttachments(design: Design, rope: Rope) {
 export function detectRopeFrames(design: Design): RopeFrame[] {
   const males = design.members.filter((m) => m.kind === "male");
   const frames: RopeFrame[] = [];
-  const female = (a: string, b: string) =>
-    design.members
-      .filter((m) => {
-        if (m.kind !== "female") return false;
-        const points = new Set([m.start, m.end]);
-        for (const c of design.connections.filter((c) => c.female === m.id)) {
-          const male = design.members.find((member) => member.id === c.male);
-          if (male) points.add(male[c.end]);
-        }
-        return points.has(a) && points.has(b);
-      })
-      .sort((a, b) => b.layer - a.layer)[0];
+  // The nodes each board touches (its ends and the tenons in its holes), gathered once: the pair loop
+  // below asks for them a number of times that grows with the square of the male count.
+  const members = new Map(design.members.map((m) => [m.id, m]));
+  const points = new Map<string, Set<string>>();
+  for (const m of design.members) if (m.kind === "female") points.set(m.id, new Set([m.start, m.end]));
+  for (const c of design.connections) {
+    const male = members.get(c.male);
+    if (male) points.get(c.female)?.add(male[c.end]);
+  }
+  const byNode = new Map<string, Member[]>();
+  for (const [id, nodes] of points)
+    for (const node of nodes) {
+      const list = byNode.get(node) ?? [];
+      list.push(members.get(id) as Member);
+      byNode.set(node, list);
+    }
+  // Outermost board first, so the first board found at both nodes is the one a rope would rest on.
+  for (const list of byNode.values()) list.sort((a, b) => b.layer - a.layer);
+  const female = (a: string, b: string) => byNode.get(a)?.find((m) => points.get(m.id)?.has(b));
   const seen = new Set<string>();
   for (let i = 0; i < males.length; i++)
     for (let j = i + 1; j < males.length; j++) {
