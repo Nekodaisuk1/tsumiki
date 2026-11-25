@@ -1,3 +1,4 @@
+import { holeOffsets } from "./catalog";
 import { validateMemberCollisions } from "./collision";
 import type { Design, Member, Vec3 } from "./design";
 import {
@@ -9,7 +10,7 @@ import {
   rematchInsertedMales,
   removeMember,
 } from "./editor";
-import { add3, cross3, dot3, holeSite, scale3, sub3 } from "./holes";
+import { add3, boardAxes, cross3, dot3, holeSite, scale3, sub3 } from "./holes";
 import { nextOuterLayer } from "./seats";
 import { rollFacing } from "./templates";
 
@@ -19,8 +20,10 @@ import { rollFacing } from "./templates";
  * - member: one member on its own; nodes it shares with other members are split off
  * - group: the member plus everything joined to it through shared nodes or hole connections
  * - all: the whole structure
+ * - set: several members picked together (`id` lists them, comma separated); like a single member,
+ *   nodes they share with members outside the set are split off
  */
-export type MoveTarget = "node" | "member" | "group" | "all";
+export type MoveTarget = "node" | "member" | "group" | "all" | "set";
 /** A rigid motion: rotate by `angle` degrees about `axis` through `pivot`, then translate. */
 export type Motion = { translate: Vec3; axis: Vec3; angle: number; pivot: Vec3 };
 
@@ -57,7 +60,7 @@ export function targetParts(design: Design, target: MoveTarget, id: string) {
     return { members: design.members.map((m) => m.id), nodes: design.nodes.map((n) => n.id) };
   if (target === "node")
     return { members: [] as string[], nodes: design.nodes.some((n) => n.id === id) ? [id] : [] };
-  const members = target === "group" ? connectedMembers(design, id) : [id];
+  const members = target === "group" ? connectedMembers(design, id) : target === "set" ? id.split(",") : [id];
   const picked = design.members.filter((m) => members.includes(m.id));
   return { members: picked.map((m) => m.id), nodes: [...new Set(picked.flatMap((m) => [m.start, m.end]))] };
 }
@@ -125,17 +128,22 @@ export function moveParts(
   const sides = boardSides(design);
   const moved = new Map<string, string>();
   const member = target === "member" ? design.members.find((m) => m.id === id) : undefined;
+  // A single member or a picked set leaves the rest of the structure where it is.
+  const detached = target === "member" || target === "set";
+  const picked = design.members.filter((m) => parts.members.includes(m.id));
   for (const nodeId of parts.nodes) {
     const shared = design.members.some(
       (m) => !parts.members.includes(m.id) && (m.start === nodeId || m.end === nodeId),
     );
-    if (target === "member" && member && shared) {
+    if (detached && shared) {
       const original = design.nodes.find((n) => n.id === nodeId);
       if (!original) continue;
       const copy = nextId(design, "n");
       design.nodes.push({ id: copy, position: [...original.position], fixed: false });
-      if (member.start === nodeId) member.start = copy;
-      if (member.end === nodeId) member.end = copy;
+      for (const m of picked) {
+        if (m.start === nodeId) m.start = copy;
+        if (m.end === nodeId) m.end = copy;
+      }
       moved.set(nodeId, copy);
     } else moved.set(nodeId, nodeId);
   }
@@ -161,16 +169,19 @@ export function moveParts(
         rotate3(boardNormal(old[0], old[1], m.roll), motion.axis, motion.angle),
       );
     }
-  if (target === "member" && member) {
-    for (const end of ["start", "end"] as const) {
-      const own = design.nodes.find((n) => n.id === member[end]);
+  if (detached) {
+    // The moved ends are used only by the moved members (shared ones were split off above), so an end
+    // that lands exactly on a node that stayed joins it.
+    for (const nodeId of new Set(moved.values())) {
+      const own = design.nodes.find((n) => n.id === nodeId);
       const landing = design.nodes.find(
         (n) =>
           own && n.id !== own.id && same(n.position, own.position) && ![...moved.values()].includes(n.id),
       );
-      // The member's own end nodes are used by nothing else (shared ones were split off above).
       if (own && landing) replaceNode(design, own.id, landing.id);
     }
+  }
+  if (target === "member" && member) {
     if (member.kind === "female") {
       const others = { ...design, members: design.members.filter((m) => m.id !== member.id) };
       const clash = others.members.some(
@@ -189,10 +200,11 @@ export function moveParts(
   rematchInsertedMales(design, member?.kind === "male" ? member.id : undefined);
   // A member moved on its own takes its ropes off: they hang on the tenons it left or it was their winder.
   const split = [...moved].filter(([from, to]) => from !== to).map(([from]) => from);
+  const movesMale = picked.some((m) => m.kind === "male");
   const dropped = design.ropes.filter(
     (r) =>
-      target === "member" &&
-      (r.windingMember === id || (member?.kind === "male" && r.route.some((n) => split.includes(n)))),
+      detached &&
+      (parts.members.includes(r.windingMember) || (movesMale && r.route.some((n) => split.includes(n)))),
   );
   design.ropes = design.ropes.filter((r) => !dropped.includes(r));
   return {
@@ -210,6 +222,16 @@ function positions(design: Design, member: Member): [Vec3, Vec3] {
 
 /** A line a part can turn about while it stays on its joints. */
 export type Hinge = { pivot: Vec3; axis: Vec3 };
+/**
+ * Drops the tiny off-axis components of a unit shaft direction. Node coordinates are rounded to 1e-6 by
+ * some edits and not by others, so a male built along a coordinate axis can lean by ~1e-6 rad. Turning a
+ * 3 m board about that leaning line lifts its far end by micrometres, which then reads as a collision or
+ * an off-seat hole. Components below 1e-5 are taken as zero; real slanted males are far above that.
+ */
+function snapAxis(axis: Vec3): Vec3 {
+  const snapped = axis.map((v) => (Math.abs(v) < 1e-5 ? 0 : v)) as Vec3;
+  return scale3(snapped, 1 / Math.hypot(...snapped));
+}
 /**
  * How the joints between a moving part and the rest of the structure restrict it:
  * - free: nothing joins it to a male outside the part
@@ -229,7 +251,7 @@ export function jointConstraint(
   const shaft = (male: Member): Hinge => {
     const [a, b] = positions(design, male);
     const v = sub3(b, a);
-    return { pivot: a, axis: scale3(v, 1 / Math.hypot(...v)) };
+    return { pivot: a, axis: snapAxis(scale3(v, 1 / Math.hypot(...v))) };
   };
   for (const a of design.members.filter((m) => inside.has(m.id)))
     for (const b of design.members.filter((m) => !inside.has(m.id))) {
@@ -508,9 +530,31 @@ export function alignHole(design: Design, target: HoleRef, moving: HoleRef): num
       `角棒からの距離が違うため重なりません（${moving.female} の穴 ${(r * 1000).toFixed(1)}mm・${target.female} の穴 ${(R * 1000).toFixed(1)}mm）`,
     );
   const angle = (Math.atan2(dot3(axis, cross3(from, to)), dot3(from, to)) * 180) / Math.PI;
+  if (Math.abs(angle) >= 1e-9)
+    moveParts(design, "member", moving.female, { translate: [0, 0, 0], axis, angle, pivot });
+  // Also when the holes already meet: laying them over each other again clears any earlier drift, on
+  // the board laid over as well when it sits on a shaft of its own.
+  squareToShaft(design, moving.female, axis);
+  const base = jointConstraint(design, "member", target.female);
+  if (base.kind === "hinge") squareToShaft(design, target.female, base.hinge.axis);
   if (Math.abs(angle) < 1e-9) return 0;
-  moveParts(design, "member", moving.female, { translate: [0, 0, 0], axis, angle, pivot });
   return angle;
+}
+
+/**
+ * Puts the far end of a board that turned about a shaft back into the plane of its tenon end, square to
+ * the shaft. Earlier turns about a slightly leaning shaft (see snapAxis) leave the far end of a long board
+ * a few micrometres off that plane, so its holes miss the seats of the boards they were laid over. Only
+ * such drift (under 0.1 mm) is removed; a board that really runs along the shaft is left alone.
+ */
+function squareToShaft(design: Design, female: string, axis: Vec3) {
+  const member = design.members.find((m) => m.id === female);
+  if (!member) return;
+  const [start, end] = positions(design, member);
+  const drift = dot3(sub3(start, end), axis);
+  if (drift === 0 || Math.abs(drift) > 1e-4) return;
+  const node = design.nodes.find((n) => n.id === member.end);
+  if (node) node.position = add3(end, scale3(axis, drift));
 }
 
 /** The hinge a board turns about, with a reason when it cannot turn. */
@@ -609,9 +653,11 @@ function meetingTurns(design: Design, a: Hinge, holeA: HoleRef, b: Hinge, holeB:
     for (const [pivot, hole, angle] of [
       [a.pivot, holeA, option.moving],
       [b.pivot, holeB, option.target],
-    ] as const)
+    ] as const) {
       if (Math.abs(angle) > 1e-9)
         moveParts(into, "member", hole.female, { translate: [0, 0, 0], axis, pivot, angle });
+      squareToShaft(into, hole.female, axis);
+    }
   };
   const clear = (option: (typeof options)[number]) => {
     const draft = structuredClone(design);
@@ -637,4 +683,177 @@ function meetingTurns(design: Design, a: Hinge, holeA: HoleRef, b: Hinge, holeB:
   // Report each angle about the board's own shaft, like a single-board turn.
   const sign = dot3(b.axis, axis) < 0 ? -1 : 1;
   return { moving: ranked[0].moving, target: sign * ranked[0].target };
+}
+
+/**
+ * The plane at the far end of the given members along `direction` (a unit axis), square to it: through
+ * the outermost of their nodes, so a male standing at that end lies in it.
+ */
+export function endPlane(design: Design, memberIds: string[], direction: Vec3): MirrorPlane {
+  const ids = new Set(
+    design.members.filter((m) => memberIds.includes(m.id)).flatMap((m) => [m.start, m.end]),
+  );
+  const reach = design.nodes.filter((n) => ids.has(n.id)).map((n) => dot3(n.position, direction));
+  if (!reach.length) throw new Error("反転する部材を選んでください");
+  // Not rounded: the end male may stand off the 1e-6 grid (e.g. after laying holes over each other), and
+  // a plane even a fraction of a micrometre beside it would make a second male next to it, not share it.
+  return { point: scale3(direction, Math.max(...reach)), normal: direction };
+}
+/** The plane square to `direction` (a unit axis) that the chosen male lies in, to mirror about it. */
+export function malePlane(design: Design, maleId: string, direction: Vec3): MirrorPlane {
+  const male = design.members.find((m) => m.id === maleId);
+  if (male?.kind !== "male") throw new Error("反転の軸にする端には雄材を選んでください");
+  if (!squareTo(design, male, direction))
+    throw new Error(`雄材 ${maleId} はこの向きと直角に交わる面に載っていません。別の向きを選んでください`);
+  return { point: scale3(direction, dot3(positions(design, male)[0], direction)), normal: direction };
+}
+/** Whether the male's shaft is square to `direction`, so it lies in a mirror plane facing that way. */
+export function squareTo(design: Design, male: Member, direction: Vec3) {
+  const [a, b] = positions(design, male);
+  const shaft = sub3(b, a);
+  return Math.abs(dot3(shaft, direction)) <= 1e-6 * Math.hypot(...shaft);
+}
+/**
+ * The axis direction to mirror toward so that `maleId` is the end: square to its shaft, from the middle of
+ * the given members toward the male along the axis it is farthest off.
+ */
+export function sideToward(design: Design, memberIds: string[], maleId: string): Vec3 | null {
+  const male = design.members.find((m) => m.id === maleId);
+  if (male?.kind !== "male") return null;
+  const [a, b] = positions(design, male);
+  const shaft = sub3(b, a);
+  const ids = new Set(
+    design.members.filter((m) => memberIds.includes(m.id)).flatMap((m) => [m.start, m.end]),
+  );
+  const points = design.nodes.filter((n) => ids.has(n.id)).map((n) => n.position);
+  if (!points.length) return null;
+  const centre = scale3(points.reduce(add3, [0, 0, 0] as Vec3), 1 / points.length);
+  const toward = sub3(a, centre);
+  let best: Vec3 | null = null;
+  let reach = 1e-6;
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(shaft[i]) > 1e-6 * Math.hypot(...shaft)) continue;
+    if (Math.abs(toward[i]) <= reach) continue;
+    reach = Math.abs(toward[i]);
+    best = [0, 0, 0];
+    best[i] = Math.sign(toward[i]);
+  }
+  return best;
+}
+/**
+ * Mirror copy joined at the end: adds the mirror image of the members across their end plane along
+ * `direction`, so the image continues the structure from its outermost male (shared with the image)
+ * instead of repeating it shifted. With `check: false` the result is not validated, for drawing a preview
+ * of an image that does not fit. Returns the new members, and the whole image: the new members plus the
+ * given ones lying on the plane, which are their own image (to mirror the image again further on).
+ * With `through`, the image is joined at that male instead of the outermost end.
+ */
+export function mirrorAtEnd(
+  design: Design,
+  memberIds: string[],
+  direction: Vec3,
+  { check = true, through }: { check?: boolean; through?: string } = {},
+): { created: string[]; image: string[] } {
+  const plane = through ? malePlane(design, through, direction) : endPlane(design, memberIds, direction);
+  const onPlane = design.members
+    .filter((m) => memberIds.includes(m.id) && mirrorCounterpart(design, m, plane) === m.id)
+    .map((m) => m.id);
+  const created = mirrorParts(design, memberIds, plane, { allowNone: !check });
+  if (check) validateMemberCollisions(design, new Set(created));
+  return { created, image: [...onPlane, ...created] };
+}
+
+/**
+ * Copies members shifted by `offset`. Copied ends that land exactly on a node use it, so a copy can
+ * join the structure at shared tenons; a copy that would lie where a member of the same kind already
+ * is, is left out (copying a bay sideways does not double the male the two bays share). Boards keep
+ * their layer where it is free, otherwise they take the innermost free layer that fits. Males copied
+ * from inserted males record their holes again. With `check: false` nothing is validated (for drawing
+ * a preview of a copy that does not fit). Ropes and rings are not copied. Returns the new members.
+ */
+/**
+ * Tenon nodes a board's middle holes land on: ends of males standing square to the board at a hole centre.
+ * The board is turned to face out along the first such tenon (it would otherwise lie on the male's body),
+ * and the nodes are returned so the board is seated and joined on them.
+ */
+function faceTenons(design: Design, board: Member): string[] {
+  const axes = boardAxes(design, board);
+  const centres = holeOffsets(axes.length, board.holeCount, board).map((t) =>
+    add3(axes.start, scale3(axes.x, t)),
+  );
+  const at = (id: string) => design.nodes.find((n) => n.id === id)?.position;
+  const nodes: string[] = [];
+  let outward: Vec3 | null = null;
+  for (const male of design.members) {
+    if (male.kind !== "male") continue;
+    for (const [tip, base] of [
+      [male.start, male.end],
+      [male.end, male.start],
+    ]) {
+      if (tip === board.start || tip === board.end) continue;
+      const p = at(tip);
+      const q = at(base);
+      if (!p || !q || !centres.some((c) => same(c, p))) continue;
+      const shaft = sub3(p, q);
+      if (Math.abs(dot3(shaft, axes.normal)) < (1 - 1e-6) * Math.hypot(...shaft)) continue;
+      nodes.push(tip);
+      outward ??= shaft;
+    }
+  }
+  if (outward && dot3(outward, boardAxes(design, board).normal) < 0)
+    board.roll = board.roll > 0 ? board.roll - 180 : board.roll + 180;
+  return nodes;
+}
+export function duplicateParts(
+  design: Design,
+  memberIds: string[],
+  offset: Vec3,
+  { check = true } = {},
+): string[] {
+  const axisAligned = offset.filter((v) => Math.abs(v) > 1e-12).length <= 1;
+  const nodeAt = (position: Vec3) => {
+    const target = axisAligned ? round(position) : position;
+    const existing = design.nodes.find((n) => same(n.position, target));
+    if (existing) return existing.id;
+    const id = nextId(design, "n");
+    design.nodes.push({ id, position: target, fixed: false });
+    return id;
+  };
+  const sources = design.members
+    .filter((m) => memberIds.includes(m.id))
+    // Males first, so boards are placed against the tenons they hang on.
+    .sort((a, b) => Number(a.kind === "female") - Number(b.kind === "female"));
+  const created: string[] = [];
+  const inserted: string[] = [];
+  let malesChecked = !check;
+  for (const source of sources) {
+    if (source.kind === "female" && !malesChecked) {
+      // The copied males stand before any board is placed on them: report their own clashes (such as two
+      // tenons meeting in one hole) rather than a board failing to fit between them.
+      validateMemberCollisions(design, new Set(created));
+      malesChecked = true;
+    }
+    const [a, b] = positions(design, source);
+    const start = nodeAt(add3(a, offset));
+    const end = nodeAt(add3(b, offset));
+    const taken = design.members.some(
+      (m) =>
+        m.kind === source.kind &&
+        ((m.start === start && m.end === end) || (m.start === end && m.end === start)),
+    );
+    if (taken) continue;
+    const copy: Member = { ...source, id: nextId(design, "m"), start, end };
+    const through = copy.kind === "female" ? faceTenons(design, copy) : [];
+    if (copy.kind === "female" && check) placeBoard(design, copy, source.layer, through);
+    else design.members.push(copy);
+    created.push(copy.id);
+    if (design.connections.some((c) => c.male === source.id)) inserted.push(copy.id);
+  }
+  if (!check) return created;
+  if (!created.length) throw new Error("その位置には同じ部材がすでにあります");
+  for (const id of inserted) rematchInsertedMales(design, id);
+  rematchInsertedMales(design);
+  connectThreadedMales(design);
+  validateMemberCollisions(design, new Set(created));
+  return created;
 }
