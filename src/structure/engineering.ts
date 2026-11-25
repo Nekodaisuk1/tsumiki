@@ -14,6 +14,8 @@ export type EngineeringSettings = {
   direction: "x" | "y" | "z";
   forceN: number;
   selfWeight: boolean;
+  support?: "fixed" | "floor";
+  friction?: number;
 };
 export const ENGINEERING_LIMITATIONS = [
   "剛接合・線形弾性梁の参考計算です。実物の材種・等級は未確認。安全判定や耐荷重保証ではありません。",
@@ -33,6 +35,10 @@ export function analyzeTimber(design: Design, settings: EngineeringSettings) {
     typeof settings.selfWeight !== "boolean"
   )
     throw new Error("木材プリセット・荷重条件が不正です（荷重は±100000 N以内）");
+  const support = settings.support ?? "fixed";
+  const friction = settings.friction ?? 0.5;
+  if (!["fixed", "floor"].includes(support) || !Number.isFinite(friction) || friction < 0 || friction > 2)
+    throw new Error("支持条件・摩擦係数が不正です（0〜2）");
   const wood = TIMBER_PRESETS[settings.preset];
   const b = design.geometry.boardWidth,
     h = design.geometry.thickness;
@@ -50,7 +56,13 @@ export function analyzeTimber(design: Design, settings: EngineeringSettings) {
   physical.jointModel = "rigid-approximation";
   physical.analysis.loadNode = settings.node;
   physical.analysis.direction = settings.direction;
-  const result = solvePhysicalFrame(physical, material, settings.forceN, settings.selfWeight);
+  const result = solvePhysicalFrame(
+    physical,
+    material,
+    settings.forceN,
+    settings.selfWeight,
+    support === "floor" ? friction : undefined,
+  );
   const members = design.members
     .map((member) => {
       const elements = result.elements.filter((e) => e.id === member.id);
@@ -78,12 +90,31 @@ export function analyzeTimber(design: Design, settings: EngineeringSettings) {
       return { id: member.id, normalMPa, bendingMPa, axialN, shearN, displacementMm, referenceRatio };
     })
     .sort((a, b) => b.normalMPa - a.normalMPa);
+  const totalMassKg = result.elements.reduce(
+    (mass, element) => mass + material.density * material.A * element.length,
+    0,
+  );
+  const totalWeightN = totalMassKg * 9.80665;
   const maxDisplacementMm = Math.max(0, ...members.map((m) => m.displacementMm));
-  const warnings: string[] = [...ENGINEERING_LIMITATIONS];
+  const warnings: string[] = ENGINEERING_LIMITATIONS.filter((_, i) => support !== "floor" || i !== 2);
+  if (support === "floor")
+    warnings.unshift(
+      "節点の固定を解除した地面接触モデル。水平床は設計の最下点に設定し、実形状の端部接点で支持します。摩擦係数は仮定値です。接合自体は剛接合のままです。落下・転倒後の運動は計算しません。",
+    );
   if (result.elements.some((e) => e.samples.some((s) => Math.hypot(...s.displacement) > e.length / 50)))
     warnings.unshift("変位が解析区間長の1/50を超えています。小変形の仮定から外れる可能性があります。");
   if (members.some((m) => m.referenceRatio >= 1))
     warnings.unshift("公称応力が基準強度との単純比較で1以上です。接合や欠損を含めた再検討が必要です。");
-  return { ...result, settings: structuredClone(settings), material, members, maxDisplacementMm, warnings };
+  return {
+    ...result,
+    settings: { ...structuredClone(settings), support, friction },
+    material,
+    members,
+    maxDisplacementMm,
+    stressScaleMPa: Math.max(0, ...members.map((m) => m.normalMPa)),
+    totalMassKg,
+    totalWeightN,
+    warnings,
+  };
 }
 export type EngineeringResult = ReturnType<typeof analyzeTimber>;

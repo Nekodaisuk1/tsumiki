@@ -1,11 +1,16 @@
 import { type Design, type Material, type Vec3, validateDesign } from "./design";
+import { floorContacts, solveFloorContact } from "./floor-contact";
 import { holeSite } from "./holes";
 import { ropeAttachments } from "./rope";
 export type RopeMode = "none" | "slack" | "taut";
 export type Excitation = "force" | "base";
 type Matrix = number[][];
 const zeros = (n: number, m = n): Matrix => Array.from({ length: n }, () => Array(m).fill(0));
-const dot = (a: number[], b: number[]) => a.reduce((s, v, i) => s + v * b[i], 0);
+const dot = (a: number[], b: number[]) => {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+};
 const sub = (a: number[], b: number[]) => a.map((v, i) => v - b[i]);
 const cross = (a: number[], b: number[]): Vec3 => [
   a[1] * b[2] - a[2] * b[1],
@@ -14,33 +19,44 @@ const cross = (a: number[], b: number[]): Vec3 => [
 ];
 const norm = (a: number[]) => Math.hypot(...a);
 const multiply = (a: Matrix, x: number[]) => a.map((row) => dot(row, x));
+/**
+ * Dense Cholesky factorization. The factor is kept in one flat row-major array so that both the
+ * factorization and the two triangular solves walk memory row by row.
+ */
 function factor(a: Matrix): (b: number[]) => number[] {
   const n = a.length;
-  const l = zeros(n);
   const scale = Math.max(...a.map((row, i) => Math.abs(row[i])));
   if (n === 0) throw new Error("自由節点がありません。支持条件を変更してください");
-  for (let i = 0; i < n; i++)
+  const l = new Float64Array(n * n);
+  for (let i = 0; i < n; i++) {
+    const row = a[i];
+    const ri = i * n;
     for (let j = 0; j <= i; j++) {
-      let v = a[i][j];
-      for (let k = 0; k < j; k++) v -= l[i][k] * l[j][k];
+      const rj = j * n;
+      let v = row[j];
+      for (let k = 0; k < j; k++) v -= l[ri + k] * l[rj + k];
       if (i === j) {
         if (v <= Math.max(1e-12, scale * 1e-12) || !Number.isFinite(v))
           throw new Error("支持・拘束不足、未接続節点、または剛性の数値条件が不適切です");
-        l[i][j] = Math.sqrt(v);
-      } else l[i][j] = v / l[j][j];
+        l[ri + j] = Math.sqrt(v);
+      } else l[ri + j] = v / l[rj + j];
     }
+  }
   return (b) => {
-    const x = Array(n).fill(0);
-    const y = Array(n).fill(0);
+    const y = new Float64Array(n);
     for (let i = 0; i < n; i++) {
+      const ri = i * n;
       let v = b[i];
-      for (let j = 0; j < i; j++) v -= l[i][j] * y[j];
-      y[i] = v / l[i][i];
+      for (let j = 0; j < i; j++) v -= l[ri + j] * y[j];
+      y[i] = v / l[ri + i];
     }
+    // Back substitution with L^T, column by column so that row i of L is read contiguously.
+    const x = Array(n).fill(0);
     for (let i = n - 1; i >= 0; i--) {
-      let v = y[i];
-      for (let j = i + 1; j < n; j++) v -= l[j][i] * x[j];
-      x[i] = v / l[i][i];
+      const ri = i * n;
+      const xi = y[i] / l[ri + i];
+      x[i] = xi;
+      for (let j = 0; j < i; j++) y[j] -= l[ri + j] * xi;
     }
     return x;
   };
@@ -156,9 +172,9 @@ export function supportProblem(design: Design): string | null {
     return `部材 ${loose.join("・")} が支持された部分とつながっていません。雄材の穴・角棒でつなぐか、削除するか、その部分の節点を固定してください（ロープだけでは支えられません）`;
   return null;
 }
-function assemble(design: Design, mode: RopeMode, materialOverride?: Material) {
+function assemble(design: Design, mode: RopeMode, materialOverride?: Material, ground = false) {
   validateDesign(design);
-  const problem = supportProblem(design);
+  const problem = ground ? null : supportProblem(design);
   if (problem) throw new Error(problem);
   if (design.version === 6 && design.jointModel === "clearance-contact")
     throw new Error("図面の丸穴・角丸凸部の接触則は未校正です。剛接合の参考比較を選んでください");
@@ -419,13 +435,29 @@ function assemble(design: Design, mode: RopeMode, materialOverride?: Material) {
       }
     }
   const free = Array.from({ length: size }, (_, i) => i).filter(
-    (i) => i >= nodeCount * 6 || !design.nodes[Math.floor(i / 6)].fixed,
+    (i) => ground || i >= nodeCount * 6 || !design.nodes[Math.floor(i / 6)].fixed,
   );
   const axis = { x: 0, y: 1, z: 2 }[design.analysis.direction];
   const loadNode = index.get(design.analysis.loadNode);
   if (loadNode === undefined) throw new Error("荷重点がありません");
-  if (design.nodes[loadNode].fixed) throw new Error("荷重点が固定されています。自由節点を選んでください");
-  return { K, mass, members, springs, joints, notes, free, axis, loadNode, size, nodeCount, recover, loadAt };
+  if (!ground && design.nodes[loadNode].fixed)
+    throw new Error("荷重点が固定されています。自由節点を選んでください");
+  return {
+    K,
+    mass,
+    members,
+    springs,
+    joints,
+    notes,
+    free,
+    axis,
+    loadNode,
+    size,
+    nodeCount,
+    recover,
+    loadAt,
+    centers,
+  };
 }
 type System = ReturnType<typeof assemble>;
 function gravityLoad(system: System, gravity: number) {
@@ -671,8 +703,14 @@ export function simulate(design: Design, mode: RopeMode, excitation: Excitation)
 }
 
 /** SI static frame analysis; kept separate from the dimensionless comparison and dynamics. */
-export function solvePhysicalFrame(design: Design, material: Material, forceN: number, selfWeight: boolean) {
-  const system = assemble(design, "none", material);
+export function solvePhysicalFrame(
+  design: Design,
+  material: Material,
+  forceN: number,
+  selfWeight: boolean,
+  friction?: number,
+) {
+  const system = assemble(design, "none", material, friction !== undefined);
   const force = Array(system.size).fill(0);
   system.loadAt(force, system.loadNode, system.axis, forceN);
   const loads = system.members.map((m) => {
@@ -697,7 +735,12 @@ export function solvePhysicalFrame(design: Design, material: Material, forceN: n
     for (let i = 0; i < 12; i++) for (let j = 0; j < 12; j++) force[m.ids[i]] += m.transform[j][i] * f[j];
     return { q, f };
   });
-  const result = equilibrium(system, force);
+  const floor = friction === undefined ? null : floorContacts(design, system.centers);
+  const ground =
+    floor && friction !== undefined
+      ? solveFloorContact(system.K, force, floor.contacts, friction, factor)
+      : null;
+  const result = ground ?? equilibrium(system, force);
   const elements = system.members.map((m, index) => {
     const u = multiply(
       m.transform,
@@ -734,17 +777,28 @@ export function solvePhysicalFrame(design: Design, material: Material, forceN: n
         position,
         displacement,
         axial: -local[0] - q[0] * x,
+        torque: -local[3],
         my: -local[4] - local[2] * x - (q[2] * x * x) / 2,
         mz: -local[5] + local[1] * x + (q[1] * x * x) / 2,
         shearY: -local[1] - q[1] * x,
         shearZ: -local[2] - q[2] * x,
       };
     });
-    return { id: m.memberId, length: m.length, local, samples };
+    return {
+      id: m.memberId,
+      length: m.length,
+      origin: m.origin,
+      basis: m.rotation.slice(0, 3).map((row) => row.slice(0, 3)),
+      local,
+      samples,
+    };
   });
   return {
     displacement: system.recover(result.u),
     reactions: result.reactions.slice(0, system.nodeCount * 6),
     elements,
+    ground: ground
+      ? { floorY: floor?.floorY, contacts: ground.groundContacts, residual: ground.contactResidual }
+      : null,
   };
 }
